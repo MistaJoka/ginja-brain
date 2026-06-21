@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+"""ginja — FOSS-first personal second brain CLI.
+Single-file executable. chmod +x, symlink to ~/bin/ginja, done.
+"""
+
+# ── SECTION 1: Imports & Constants ─────────────────────────────────────────
+
+import sys
+import os
+import re
+import json
+import uuid
+import datetime
+import pathlib
+import textwrap
+
+try:
+    import readline  # noqa: F401 — enables arrow-key history in chat REPL
+except ImportError:
+    pass
+
+try:
+    import click
+except ImportError:
+    sys.exit("Missing dependency: pip install click")
+
+try:
+    import httpx
+except ImportError:
+    sys.exit("Missing dependency: pip install httpx")
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("Missing dependency: pip install pyyaml")
+
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, VectorParams, PointStruct
+except ImportError:
+    sys.exit("Missing dependency: pip install qdrant-client")
+
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.table import Table
+except ImportError:
+    sys.exit("Missing dependency: pip install rich")
+
+
+console = Console()
+
+GINJA_DIR   = pathlib.Path.home() / ".ginja"
+CONFIG_FILE = GINJA_DIR / "config.yaml"
+PERSONA_FILE = GINJA_DIR / "persona.md"
+HISTORY_DIR = GINJA_DIR / "history"
+
+COLLECTION_NAME = "ginja_memories"
+EMBEDDING_DIM   = 768    # nomic-embed-text output dimension — must match collection
+CHUNK_SIZE      = 512    # approx tokens per chunk
+CHUNK_OVERLAP   = 50     # approx token overlap between chunks
+RAG_MIN_SCORE   = 0.55   # cosine similarity threshold — below this, discard
+
+CODE_KEYWORDS = frozenset({
+    "python", "javascript", "typescript", "rust", "golang", "java",
+    "bash", "shell", "function", "class", "import", "def ", "const ",
+    "let ", "var ", "return ", "dockerfile", "algorithm", "debug",
+    "exception", "compile", "runtime", "syntax", "api endpoint",
+    "regex", "sql", "query database", "recursion", "async", "await",
+    "thread", "socket", "http request", "serialize", "deserialize",
+    "refactor", "unittest", "pytest", "traceback", "stack trace",
+    "segfault", "segmentation fault", "null pointer", "type error",
+})
+
+# ── SECTION 2: Config Loading ───────────────────────────────────────────────
+
+DEFAULT_CONFIG: dict = {
+    "ollama_url":    "http://localhost:11434",
+    "qdrant_url":    "http://localhost:6333",
+    "qdrant_api_key": None,
+    "embed_model":   "nomic-embed-text",
+    "default_model": "mistral:7b",
+    "fast_model":    "llama3.2:3b",
+    "code_model":    "qwen2.5-coder:7b",
+    "gemini_model":  "gemini/gemini-1.5-flash",
+    "gemini_api_key": None,
+    "top_k":         5,
+    "serve_port":    8765,
+    "persona_file":  str(PERSONA_FILE),
+}
+
+_ENV_MAP = {
+    "GINJA_OLLAMA_URL":    "ollama_url",
+    "GINJA_QDRANT_URL":    "qdrant_url",
+    "GINJA_QDRANT_API_KEY": "qdrant_api_key",
+    "GINJA_GEMINI_API_KEY": "gemini_api_key",
+    "GEMINI_API_KEY":       "gemini_api_key",
+    "GINJA_TOP_K":          "top_k",
+    "GINJA_DEFAULT_MODEL":  "default_model",
+}
+
+
+def load_config() -> dict:
+    cfg = DEFAULT_CONFIG.copy()
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            file_cfg = yaml.safe_load(f) or {}
+        cfg.update(file_cfg)
+    for env_key, cfg_key in _ENV_MAP.items():
+        val = os.environ.get(env_key)
+        if val is not None:
+            cfg[cfg_key] = int(val) if cfg_key == "top_k" else val
+    return cfg
+
+
+# ── SECTION 3: Ollama Client ────────────────────────────────────────────────
+
+def ollama_embed(cfg: dict, text: str) -> list:
+    """POST /api/embeddings → list[float]. Synchronous."""
+    url = cfg["ollama_url"] + "/api/embeddings"
+    try:
+        with httpx.Client(timeout=30) as client:
+            r = client.post(url, json={"model": cfg["embed_model"], "prompt": text})
+            if r.status_code == 404:
+                raise click.ClickException(
+                    f"Embed model '{cfg['embed_model']}' not found.\n"
+                    f"Pull it with: ollama pull {cfg['embed_model']}"
+                )
+            r.raise_for_status()
+            data = r.json()
+            return data.get("embedding") or data.get("embeddings", [[]])[0]
+    except click.ClickException:
+        raise
+    except httpx.ConnectError:
+        raise click.ClickException(
+            f"Cannot reach Ollama at {cfg['ollama_url']}.\n"
+            "Start it with: ollama serve"
+        )
+    except Exception as e:
+        raise click.ClickException(f"Embedding failed: {e}")
+
+
+def ollama_stream(cfg: dict, model: str, messages: list, print_live: bool = True) -> str:
+    """
+    POST /api/chat with stream=True. Ollama returns NDJSON — one JSON object
+    per line. Prints tokens to stdout when print_live=True. Always returns the
+    full assembled response string.
+    """
+    url = cfg["ollama_url"] + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "options": {"num_ctx": 4096},   # cap context to fit GTX 970 4GB VRAM
+    }
+    full_response: list[str] = []
+    try:
+        with httpx.Client(timeout=180) as client:
+            with client.stream("POST", url, json=payload) as response:
+                if response.status_code == 404:
+                    raise click.ClickException(
+                        f"Model '{model}' not found in Ollama.\n"
+                        f"Pull it with: ollama pull {model}"
+                    )
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    token = chunk.get("message", {}).get("content", "")
+                    if token:
+                        full_response.append(token)
+                        if print_live:
+                            print(token, end="", flush=True)
+                    if chunk.get("done"):
+                        break
+    except click.ClickException:
+        raise
+    except httpx.ConnectError:
+        raise click.ClickException(
+            f"Cannot reach Ollama at {cfg['ollama_url']}. Is it running?"
+        )
+    except Exception as e:
+        raise click.ClickException(f"Generation failed: {e}")
+    if print_live:
+        print()  # final newline after stream
+    return "".join(full_response)
+
+
+def ollama_generate_gemini(cfg: dict, messages: list) -> str:
+    """Gemini fallback via litellm. Lazy-imported so it's optional."""
+    try:
+        import litellm
+    except ImportError:
+        raise click.ClickException("--hard flag requires: pip install litellm")
+    api_key = cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise click.ClickException(
+            "Gemini requires an API key.\n"
+            "Set GINJA_GEMINI_API_KEY env var or add gemini_api_key to ~/.ginja/config.yaml."
+        )
+    try:
+        response = litellm.completion(
+            model=cfg["gemini_model"],
+            messages=messages,
+            api_key=api_key,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        raise click.ClickException(f"Gemini generation failed: {e}")
+
+
+# ── SECTION 4: Qdrant Client ────────────────────────────────────────────────
+
+_collection_ready = False  # cached per-process; helps in serve mode
+
+
+def get_qdrant(cfg: dict) -> QdrantClient:
+    try:
+        kwargs: dict = {"url": cfg["qdrant_url"]}
+        if cfg.get("qdrant_api_key"):
+            kwargs["api_key"] = cfg["qdrant_api_key"]
+        client = QdrantClient(**kwargs)
+        client.get_collections()  # connectivity check
+        return client
+    except Exception as e:
+        raise click.ClickException(
+            f"Cannot reach Qdrant at {cfg['qdrant_url']}.\n"
+            f"Start it with: docker compose up -d qdrant\nDetail: {e}"
+        )
+
+
+def ensure_collection(client: QdrantClient) -> None:
+    global _collection_ready
+    if _collection_ready:
+        return
+    existing = {c.name for c in client.get_collections().collections}
+    if COLLECTION_NAME not in existing:
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        )
+        console.print(f"[green]Created Qdrant collection '{COLLECTION_NAME}'[/green]")
+    _collection_ready = True
+
+
+def _text_id(text: str) -> str:
+    """Deterministic UUID from text content — enables idempotent upserts."""
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, text))
+
+
+def qdrant_store(client: QdrantClient, text: str, vector: list, metadata: dict) -> str:
+    ensure_collection(client)
+    point_id = _text_id(text)
+    payload = {
+        "text": text,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        **metadata,
+    }
+    client.upsert(
+        collection_name=COLLECTION_NAME,
+        points=[PointStruct(id=point_id, vector=vector, payload=payload)],
+    )
+    return point_id
+
+
+def qdrant_search(client: QdrantClient, vector: list, top_k: int = 5) -> list:
+    ensure_collection(client)
+    results = client.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=vector,
+        limit=top_k,
+        with_payload=True,
+    )
+    return [
+        {
+            "text":      r.payload.get("text", ""),
+            "score":     round(r.score, 4),
+            "source":    r.payload.get("source", "manual"),
+            "timestamp": r.payload.get("timestamp", ""),
+        }
+        for r in results
+    ]
+
+
+# ── SECTION 5: RAG Pipeline ─────────────────────────────────────────────────
+
+def build_rag_context(cfg: dict, query: str) -> tuple:
+    """
+    Embed query → search Qdrant → filter by score → format context block.
+    Returns (context_str, raw_results). RAG failures are non-fatal for
+    ask/chat — caller gets empty context instead of an error.
+    """
+    try:
+        vector = ollama_embed(cfg, query)
+        client = get_qdrant(cfg)
+        results = qdrant_search(client, vector, top_k=cfg["top_k"])
+    except click.ClickException:
+        raise
+    except Exception:
+        return "", []
+
+    relevant = [r for r in results if r["score"] >= RAG_MIN_SCORE]
+    if not relevant:
+        return "", []
+
+    snippets = [
+        f"[Memory {i} | score={r['score']} | source={r['source']}]\n{r['text']}"
+        for i, r in enumerate(relevant, 1)
+    ]
+    context_block = (
+        "--- Relevant memories ---\n"
+        + "\n\n".join(snippets)
+        + "\n--- End memories ---"
+    )
+    return context_block, relevant
+
+
+def build_messages(cfg: dict, query: str, context: str, history: list = None) -> list:
+    """
+    Assemble messages list for /api/chat.
+    Order: system (persona + context) → conversation history → user query
+    """
+    persona_path = pathlib.Path(cfg.get("persona_file", str(PERSONA_FILE)))
+    persona = (
+        persona_path.read_text(encoding="utf-8")
+        if persona_path.exists()
+        else "You are a helpful personal assistant named Ginja."
+    )
+
+    system_parts = [persona.strip()]
+    if context:
+        system_parts.append(context)
+
+    messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": query})
+    return messages
+
+
+# ── SECTION 6: Model Router ─────────────────────────────────────────────────
+
+def route_model(cfg: dict, query: str,
+                fast: bool = False, code: bool = False, hard: bool = False) -> str:
+    """
+    Dispatch to the right model. Priority:
+    --hard > --fast > --code > code_heuristic(query) > default
+    Returns model name string or "gemini" sentinel for Gemini fallback.
+    """
+    if hard:
+        return "gemini"
+    if fast:
+        return cfg["fast_model"]
+    if code:
+        return cfg["code_model"]
+    if _detect_code(query):
+        return cfg["code_model"]
+    return cfg["default_model"]
+
+
+def _detect_code(text: str) -> bool:
+    """Heuristic code detection: fences, extensions, or 2+ keyword hits."""
+    if "```" in text:
+        return True
+    text_lower = text.lower()
+    if re.search(
+        r'\b\w+\.(py|js|ts|rs|go|java|sh|bash|c|cpp|h|rb|php|sql|css|html|yaml|toml|json)\b',
+        text_lower
+    ):
+        return True
+    hits = sum(1 for kw in CODE_KEYWORDS if kw in text_lower)
+    return hits >= 2
+
+
+# ── SECTION 7: Chunker ──────────────────────────────────────────────────────
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list:
+    """
+    Split text into overlapping chunks.
+    Token count approximated as word_count * 1.3 (conservative, works for English/code).
+    CJK and other scripts will over-chunk — acceptable for personal use.
+    """
+    words = text.split()
+    if not words:
+        return []
+    word_chunk   = max(1, int(chunk_size / 1.3))
+    word_overlap = max(0, int(overlap / 1.3))
+    step         = max(1, word_chunk - word_overlap)
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = min(start + word_chunk, len(words))
+        chunks.append(" ".join(words[start:end]))
+        if end == len(words):
+            break
+        start += step
+    return chunks
+
+
+def load_text_from_path(path_or_url: str) -> tuple:
+    """Load text from a local file or URL. Returns (text, source_label)."""
+    if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+        try:
+            with httpx.Client(timeout=30, follow_redirects=True) as client:
+                r = client.get(path_or_url)
+                r.raise_for_status()
+                ct = r.headers.get("content-type", "")
+                if "html" in ct:
+                    text = re.sub(r'<[^>]+>', ' ', r.text)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                else:
+                    text = r.text
+            return text, path_or_url
+        except click.ClickException:
+            raise
+        except Exception as e:
+            raise click.ClickException(f"Failed to fetch {path_or_url}: {e}")
+    else:
+        p = pathlib.Path(path_or_url).expanduser().resolve()
+        if not p.exists():
+            raise click.ClickException(f"File not found: {p}")
+        try:
+            return p.read_text(encoding="utf-8", errors="replace"), str(p)
+        except Exception as e:
+            raise click.ClickException(f"Cannot read {p}: {e}")
+
+
+# ── SECTION 8: Rich Output ──────────────────────────────────────────────────
+
+def print_recall_results(results: list) -> None:
+    if not results:
+        console.print("[yellow]No memories found.[/yellow]")
+        return
+    table = Table(title="Ginja Memories", show_lines=True, expand=True)
+    table.add_column("#",       style="dim",     width=3)
+    table.add_column("Score",   style="cyan",    width=6)
+    table.add_column("Source",  style="magenta", width=24)
+    table.add_column("Date",    style="dim",     width=12)
+    table.add_column("Text",    style="white",   ratio=1)
+    for i, r in enumerate(results, 1):
+        ts = r.get("timestamp", "")[:10] if r.get("timestamp") else "—"
+        table.add_row(
+            str(i),
+            str(r["score"]),
+            textwrap.shorten(r.get("source", "—"), width=24),
+            ts,
+            textwrap.shorten(r["text"], width=180),
+        )
+    console.print(table)
+
+
+def print_status_panel(ollama_data: dict, qdrant_data: dict, cfg: dict) -> None:
+    lines = []
+
+    if "error" in ollama_data:
+        lines.append(f"[red]Ollama:[/red]  ✗  {ollama_data['error']}")
+    else:
+        models = [m.get("name", "?") for m in ollama_data.get("models", [])]
+        model_str = ", ".join(models) if models else "(no models pulled yet)"
+        lines.append(f"[green]Ollama:[/green]  ✓  {model_str}")
+
+    if "error" in qdrant_data:
+        lines.append(f"[red]Qdrant:[/red]  ✗  {qdrant_data['error']}")
+    else:
+        count = qdrant_data.get("collection_count", "?")
+        lines.append(f"[green]Qdrant:[/green]  ✓  {count} points in '{COLLECTION_NAME}'")
+
+    lines += [
+        "",
+        f"[dim]Embed model  [/dim] {cfg['embed_model']}",
+        f"[dim]Fast model   [/dim] {cfg['fast_model']}",
+        f"[dim]Default model[/dim] {cfg['default_model']}",
+        f"[dim]Code model   [/dim] {cfg['code_model']}",
+        f"[dim]Top-k RAG    [/dim] {cfg['top_k']}",
+        f"[dim]Serve port   [/dim] {cfg['serve_port']}",
+        f"[dim]Persona file [/dim] {cfg.get('persona_file', str(PERSONA_FILE))}",
+    ]
+    console.print(Panel("\n".join(lines), title="[bold cyan]ginja status[/bold cyan]", expand=False))
+
+
+# ── SECTION 9: Click CLI ────────────────────────────────────────────────────
+
+@click.group()
+@click.pass_context
+def cli(ctx):
+    """ginja — FOSS-first personal second brain CLI."""
+    ctx.ensure_object(dict)
+    ctx.obj["cfg"] = load_config()
+
+
+# ── ask ─────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("question")
+@click.option("--fast",   "-f", is_flag=True, help="Use fast model (llama3.2:3b)")
+@click.option("--code",   "-c", is_flag=True, help="Use code model (qwen2.5-coder:7b)")
+@click.option("--hard",         is_flag=True, help="Use Gemini fallback (requires API key)")
+@click.option("--no-rag",       is_flag=True, help="Skip RAG memory injection")
+@click.option("--top-k", "top_k", type=int, default=None, help="Memories to retrieve (overrides config)")
+@click.option("--model",  "-m", default=None, help="Override model directly")
+@click.pass_context
+def ask(ctx, question, fast, code, hard, no_rag, top_k, model):
+    """One-shot question with streaming output and RAG context."""
+    cfg = ctx.obj["cfg"]
+    if top_k is not None:
+        cfg["top_k"] = top_k
+
+    chosen = model or route_model(cfg, question, fast=fast, code=code, hard=hard)
+    context = ""
+    if not no_rag:
+        context, _ = build_rag_context(cfg, question)
+
+    messages = build_messages(cfg, question, context)
+
+    if chosen == "gemini":
+        console.print("[dim]Model: Gemini[/dim]")
+        response = ollama_generate_gemini(cfg, messages)
+        console.print(Markdown(response))
+    else:
+        console.print(f"[dim]Model: {chosen}[/dim]")
+        ollama_stream(cfg, chosen, messages, print_live=True)
+
+
+# ── remember ─────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("text", required=False, default=None)
+@click.option("--file", "-f", "file_path", type=click.Path(), default=None,
+              help="Read and store the content of a file")
+@click.pass_context
+def remember(ctx, text, file_path):
+    """Store text or a file as a searchable memory."""
+    cfg = ctx.obj["cfg"]
+    if file_path:
+        content, source = load_text_from_path(file_path)
+    elif text:
+        content, source = text, "manual"
+    else:
+        raise click.ClickException("Provide text as an argument or use --file path.")
+
+    with console.status("[bold green]Embedding and storing..."):
+        vector = ollama_embed(cfg, content)
+        client = get_qdrant(cfg)
+        pid = qdrant_store(client, content, vector, {"source": source})
+    console.print(f"[green]✓[/green] Stored  [dim](id={pid[:8]}...)[/dim]")
+
+
+# ── recall ────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("query")
+@click.option("--top-k", "top_k", type=int, default=5, help="Number of results")
+@click.pass_context
+def recall(ctx, query, top_k):
+    """Semantic search over stored memories."""
+    cfg = ctx.obj["cfg"]
+    cfg["top_k"] = top_k
+    with console.status("[bold green]Searching memories..."):
+        vector = ollama_embed(cfg, query)
+        client = get_qdrant(cfg)
+        results = qdrant_search(client, vector, top_k=top_k)
+    print_recall_results(results)
+
+
+# ── ingest ────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("target", metavar="FILE_OR_URL")
+@click.option("--chunk-size", "chunk_size", type=int, default=CHUNK_SIZE,
+              help="Approximate tokens per chunk (default 512)")
+@click.option("--overlap", type=int, default=CHUNK_OVERLAP,
+              help="Approximate token overlap between chunks (default 50)")
+@click.option("--source", default=None,
+              help="Override source label stored in metadata")
+@click.pass_context
+def ingest(ctx, target, chunk_size, overlap, source):
+    """Chunk a file or URL and store every chunk as a searchable memory."""
+    cfg = ctx.obj["cfg"]
+    with console.status(f"[bold green]Loading {target}..."):
+        text, detected_source = load_text_from_path(target)
+    source_label = source or detected_source
+    chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+    if not chunks:
+        raise click.ClickException("No text content found to ingest.")
+
+    client = get_qdrant(cfg)
+    with console.status("[bold green]Ingesting...") as status:
+        for i, chunk in enumerate(chunks, 1):
+            status.update(f"[bold green]Ingesting chunk {i}/{len(chunks)}...")
+            vector = ollama_embed(cfg, chunk)
+            qdrant_store(client, chunk, vector, {"source": source_label, "chunk_index": i})
+    console.print(
+        f"[green]✓[/green] Ingested [bold]{len(chunks)}[/bold] chunks "
+        f"from [dim]{source_label}[/dim]"
+    )
+
+
+# ── chat ──────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--fast",   "-f", is_flag=True, help="Force fast model")
+@click.option("--code",   "-c", is_flag=True, help="Force code model")
+@click.option("--hard",         is_flag=True, help="Force Gemini")
+@click.option("--no-rag",       is_flag=True, help="Disable RAG for this session")
+@click.option("--session",      default=None, help="Session name to resume (default: timestamp)")
+@click.pass_context
+def chat(ctx, fast, code, hard, no_rag, session):
+    """Interactive REPL with persistent history and RAG context."""
+    cfg = ctx.obj["cfg"]
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    session_id   = session or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    history_file = HISTORY_DIR / f"{session_id}.json"
+
+    conversation: list = []
+    if history_file.exists():
+        try:
+            conversation = json.loads(history_file.read_text(encoding="utf-8"))
+            console.print(
+                f"[dim]Resumed session '{session_id}' "
+                f"({len(conversation) // 2} prior exchanges)[/dim]"
+            )
+        except Exception:
+            pass
+
+    console.print(Panel(
+        "[bold green]ginja chat[/bold green]  "
+        "Type [bold]exit[/bold] or press Ctrl-D to quit.\n"
+        f"Session: [dim]{session_id}[/dim]",
+        expand=False,
+    ))
+
+    while True:
+        try:
+            user_input = input("\n[you] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Session saved.[/dim]")
+            break
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit", ":q", "bye"):
+            console.print("[dim]Session saved.[/dim]")
+            break
+
+        chosen = route_model(cfg, user_input, fast=fast, code=code, hard=hard)
+
+        context = ""
+        if not no_rag:
+            try:
+                context, _ = build_rag_context(cfg, user_input)
+            except Exception:
+                pass
+
+        messages = build_messages(cfg, user_input, context, history=conversation)
+        console.print(f"[dim][{chosen}][/dim] ", end="")
+
+        try:
+            if chosen == "gemini":
+                response_text = ollama_generate_gemini(cfg, messages)
+                console.print(Markdown(response_text))
+            else:
+                response_text = ollama_stream(cfg, chosen, messages, print_live=True)
+        except click.ClickException as e:
+            console.print(f"[red]Error:[/red] {e.format_message()}")
+            continue
+
+        conversation.append({"role": "user",      "content": user_input})
+        conversation.append({"role": "assistant",  "content": response_text})
+        try:
+            history_file.write_text(json.dumps(conversation, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+
+# ── status ────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.pass_context
+def status(ctx):
+    """Show Ollama models, Qdrant health, and current config."""
+    cfg = ctx.obj["cfg"]
+    with console.status("[bold green]Checking services..."):
+        try:
+            with httpx.Client(timeout=5) as client:
+                r = client.get(cfg["ollama_url"] + "/api/tags")
+                ollama_data = r.json()
+        except Exception as e:
+            ollama_data = {"error": str(e)}
+
+        try:
+            with httpx.Client(timeout=5) as client:
+                client.get(cfg["qdrant_url"] + "/health").raise_for_status()
+            qclient = QdrantClient(url=cfg["qdrant_url"])
+            try:
+                coll = qclient.get_collection(COLLECTION_NAME)
+                qdrant_data = {"collection_count": coll.points_count}
+            except Exception:
+                qdrant_data = {"collection_count": "0 (not yet created)"}
+        except Exception as e:
+            qdrant_data = {"error": str(e)}
+
+    print_status_panel(ollama_data, qdrant_data, cfg)
+
+
+# ── context (called by cd hook) ───────────────────────────────────────────────
+
+@cli.command("context")
+@click.option("--dir", "directory", default=None,
+              help="Directory path to store as context (default: cwd)")
+@click.pass_context
+def update_context(ctx, directory):
+    """Silently store current working directory context (called by cd hook)."""
+    cfg = ctx.obj["cfg"]
+    directory = directory or os.getcwd()
+    summary = f"Current working directory: {directory}"
+    try:
+        vector = ollama_embed(cfg, summary)
+        client = get_qdrant(cfg)
+        qdrant_store(client, summary, vector, {"source": "cd_hook", "dir": directory})
+    except Exception:
+        pass  # must never produce visible output or error — it runs in a bg subshell
+
+
+# ── serve (n8n / webhook integration) ────────────────────────────────────────
+
+@cli.command()
+@click.option("--port", default=None, type=int, help="HTTP port (overrides config serve_port)")
+@click.pass_context
+def serve(ctx, port):
+    """Start HTTP server for n8n webhook integration."""
+    cfg = ctx.obj["cfg"]
+    _run_flask_server(cfg, port or cfg["serve_port"])
+
+
+# ── SECTION 10: Flask serve ─────────────────────────────────────────────────
+
+def _run_flask_server(cfg: dict, port: int) -> None:
+    try:
+        from flask import Flask, request, jsonify
+    except ImportError:
+        raise click.ClickException("serve requires: pip install flask")
+
+    # Initialise Qdrant connection once, reuse across requests
+    q_client = get_qdrant(cfg)
+    ensure_collection(q_client)
+
+    app = Flask("ginja")
+
+    @app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({"status": "ok", "service": "ginja"})
+
+    @app.route("/ask", methods=["POST"])
+    def handle_ask():
+        data = request.get_json(force=True) or {}
+        query = data.get("query", "").strip()
+        if not query:
+            return jsonify({"error": "query field required"}), 400
+        fast   = bool(data.get("fast", False))
+        hard   = bool(data.get("hard", False))
+        code   = bool(data.get("code", False))
+        no_rag = bool(data.get("no_rag", False))
+        chosen = data.get("model") or route_model(cfg, query, fast=fast, code=code, hard=hard)
+        context_str = ""
+        if not no_rag:
+            try:
+                context_str, _ = build_rag_context(cfg, query)
+            except Exception:
+                pass
+        messages = build_messages(cfg, query, context_str)
+        try:
+            if chosen == "gemini":
+                answer = ollama_generate_gemini(cfg, messages)
+            else:
+                answer = ollama_stream(cfg, chosen, messages, print_live=False)
+            return jsonify({"answer": answer, "model": chosen})
+        except click.ClickException as e:
+            return jsonify({"error": e.format_message()}), 500
+
+    @app.route("/remember", methods=["POST"])
+    def handle_remember():
+        data = request.get_json(force=True) or {}
+        text = data.get("text", "").strip()
+        if not text:
+            return jsonify({"error": "text field required"}), 400
+        source = data.get("source", "n8n")
+        try:
+            vector = ollama_embed(cfg, text)
+            pid    = qdrant_store(q_client, text, vector, {"source": source})
+            return jsonify({"stored": True, "id": pid})
+        except click.ClickException as e:
+            return jsonify({"error": e.format_message()}), 500
+
+    @app.route("/recall", methods=["POST"])
+    def handle_recall():
+        data = request.get_json(force=True) or {}
+        query = data.get("query", "").strip()
+        if not query:
+            return jsonify({"error": "query field required"}), 400
+        top_k = int(data.get("top_k", cfg["top_k"]))
+        try:
+            vector  = ollama_embed(cfg, query)
+            results = qdrant_search(q_client, vector, top_k=top_k)
+            return jsonify({"results": results})
+        except click.ClickException as e:
+            return jsonify({"error": e.format_message()}), 500
+
+    console.print(Panel(
+        f"[green]Listening on[/green] [bold]http://0.0.0.0:{port}[/bold]\n\n"
+        "  [cyan]POST /ask[/cyan]      {\"query\": \"...\", \"fast\": false, \"hard\": false}\n"
+        "  [cyan]POST /remember[/cyan] {\"text\": \"...\", \"source\": \"n8n\"}\n"
+        "  [cyan]POST /recall[/cyan]   {\"query\": \"...\", \"top_k\": 5}\n"
+        "  [cyan]GET  /health[/cyan]   → {\"status\": \"ok\"}\n\n"
+        "[dim]Ctrl-C to stop[/dim]",
+        title="[bold cyan]ginja serve[/bold cyan]",
+        expand=False,
+    ))
+    try:
+        app.run(host="0.0.0.0", port=port, debug=False)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Server stopped.[/dim]")
+
+
+# ── SECTION 11: Entrypoint ──────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    cli()

@@ -1,0 +1,38 @@
+networks:
+  homelab:
+    external: true   # create once with: docker network create homelab
+
+volumes:
+  qdrant_storage:
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ginja-qdrant
+    restart: unless-stopped
+    networks:
+      - homelab
+    ports:
+      - "6333:6333"   # REST API  → http://localhost:6333
+      - "6334:6334"   # gRPC (optional)
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: "6333"
+
+  # ── Optional: n8n ──────────────────────────────────────────────────────────
+  # Uncomment to run n8n alongside Qdrant on the homelab network.
+  # n8n:
+  #   image: n8nio/n8n:latest
+  #   container_name: ginja-n8n
+  #   restart: unless-stopped
+  #   networks:
+  #     - homelab
+  #   ports:
+  #     - "5678:5678"
+  #   volumes:
+  #     - ~/.n8n:/home/node/.n8n
+  #   environment:
+  #     N8N_HOST: "localhost"
+  #     N8N_PORT: "5678"
+  #     WEBHOOK_URL: "http://localhost:5678/"
