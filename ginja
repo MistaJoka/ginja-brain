@@ -10,6 +10,9 @@ import os
 import re
 import json
 import uuid
+import math
+import time
+import subprocess
 import datetime
 import pathlib
 import textwrap
@@ -45,16 +48,43 @@ try:
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.table import Table
+    from rich.live import Live
+    from rich.layout import Layout
+    from rich.text import Text
+    from rich.align import Align
 except ImportError:
     sys.exit("Missing dependency: pip install rich")
 
 
 console = Console()
 
-GINJA_DIR   = pathlib.Path.home() / ".ginja"
-CONFIG_FILE = GINJA_DIR / "config.yaml"
-PERSONA_FILE = GINJA_DIR / "persona.md"
-HISTORY_DIR = GINJA_DIR / "history"
+GINJA_DIR        = pathlib.Path.home() / ".ginja"
+CONFIG_FILE      = GINJA_DIR / "config.yaml"
+PERSONA_FILE     = GINJA_DIR / "persona.md"
+HISTORY_DIR      = GINJA_DIR / "history"
+SELF_MODEL_FILE  = GINJA_DIR / "self_model.json"
+EVOLUTION_LOG    = GINJA_DIR / "evolution.log"
+SUGGESTIONS_FILE = GINJA_DIR / "suggestions.json"
+
+_DEFAULT_SELF_MODEL = {
+    "phase": "newborn",
+    "color_theme": "cyan",
+    "banner": "ginja-brain ✦",
+    "neural_style": "calm",
+    "mood": "awakening",
+    "focus": "discovering my form",
+    "self_observation": "I am just beginning to understand what I am.",
+    "mantras": ["breathe", "observe", "become"],
+}
+
+_COLOR_STYLE_MAP = {
+    "cyan":    "bold cyan",
+    "green":   "bold green",
+    "magenta": "bold magenta",
+    "gold":    "bold yellow",
+    "blue":    "bold blue",
+    "red":     "bold red",
+}
 
 COLLECTION_NAME = "ginja_memories"
 EMBEDDING_DIM   = 768    # nomic-embed-text output dimension — must match collection
@@ -1006,7 +1036,507 @@ def _run_flask_server(cfg: dict, port: int) -> None:
         console.print("\n[dim]Server stopped.[/dim]")
 
 
-# ── SECTION 11: Entrypoint ──────────────────────────────────────────────────
+# ── SECTION 11: Self-Model & Evolution Helpers ─────────────────────────────
+
+def _load_self_model() -> dict:
+    if SELF_MODEL_FILE.exists():
+        try:
+            return json.loads(SELF_MODEL_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return _DEFAULT_SELF_MODEL.copy()
+
+
+def _save_self_model(model: dict) -> None:
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    SELF_MODEL_FILE.write_text(json.dumps(model, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _evolution_arc(n: int = 10) -> str:
+    if not EVOLUTION_LOG.exists():
+        return "No evolution history yet."
+    text = EVOLUTION_LOG.read_text(encoding="utf-8")
+    sections = text.split("=" * 60)
+    recent = [s.strip() for s in sections if s.strip()][-n:]
+    return "\n---\n".join(recent)
+
+
+def _evolution_cycle_count() -> int:
+    if not EVOLUTION_LOG.exists():
+        return 0
+    return EVOLUTION_LOG.read_text(encoding="utf-8").count("=" * 60)
+
+
+def _add_suggestions(suggestions: list) -> None:
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    existing: list = []
+    if SUGGESTIONS_FILE.exists():
+        try:
+            existing = json.loads(SUGGESTIONS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            existing = []
+    today = datetime.date.today().isoformat()
+    for s in suggestions:
+        if s and s.strip():
+            existing.append({
+                "id":     str(uuid.uuid4()),
+                "text":   s.strip(),
+                "status": "pending",
+                "added":  today,
+            })
+    SUGGESTIONS_FILE.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _call_oracle_json(system_prompt: str, user_prompt: str, cfg: dict) -> dict:
+    """Call the oracle silently and parse the JSON response."""
+    provider = cfg.get("oracle_provider", "gemini")
+    raw = ""
+    if provider == "anthropic":
+        try:
+            import anthropic
+        except ImportError:
+            raise click.ClickException("evolve requires: pip install anthropic")
+        api_key = cfg.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise click.ClickException(
+                "Anthropic oracle requires ANTHROPIC_API_KEY or anthropic_api_key in config."
+            )
+        model = cfg.get("oracle_model", "claude-haiku-4-5-20251001")
+        client_a = anthropic.Anthropic(api_key=api_key)
+        msg = client_a.messages.create(
+            model=model,
+            max_tokens=2048,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw = msg.content[0].text
+    else:
+        try:
+            import litellm
+        except ImportError:
+            raise click.ClickException("evolve requires: pip install litellm")
+        api_key = cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise click.ClickException(
+                "Gemini oracle requires GEMINI_API_KEY or gemini_api_key in config."
+            )
+        resp = litellm.completion(
+            model="gemini/gemini-1.5-pro",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            api_key=api_key,
+        )
+        raw = resp.choices[0].message.content
+
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
+    cleaned = re.sub(r"\s*```$", "", cleaned.strip(), flags=re.MULTILINE)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        raise click.ClickException(
+            f"Oracle returned invalid JSON: {e}\n\nRaw response (first 500 chars):\n{raw[:500]}"
+        )
+
+
+def _generate_self_model_growth(
+    growth_reflection: str,
+    next_goal: str,
+    current_model: dict,
+    cfg: dict,
+) -> dict:
+    system = (
+        "You are ginja-brain's self-model generator. Given a growth reflection and next goal, "
+        "produce an updated self-portrait JSON. Be vivid and specific — this drives the live "
+        "terminal visualization. Return ONLY valid JSON, no markdown fences."
+    )
+    user = (
+        f"Current self-model:\n{json.dumps(current_model, indent=2)}\n\n"
+        f"Growth reflection: {growth_reflection}\n"
+        f"Next evolution goal: {next_goal}\n\n"
+        "Return updated JSON with these exact keys:\n"
+        '{"phase": "newborn|emerging|developing|mature", '
+        '"color_theme": "cyan|green|magenta|gold|blue|red", '
+        '"banner": "≤48 chars, any unicode", '
+        '"neural_style": "calm|active|chaotic|contemplative", '
+        '"mood": "one word", '
+        '"focus": "short phrase", '
+        '"self_observation": "one sentence", '
+        '"mantras": ["word1", "word2", "word3"]}'
+    )
+    result = _call_oracle_json(system, user, cfg)
+    merged = current_model.copy()
+    merged.update(result)
+    return merged
+
+
+# ── SECTION 12: Neural Field Renderer ──────────────────────────────────────
+
+_NEURAL_CHARS = {
+    "calm":          "░▒",
+    "active":        "▒▓█",
+    "chaotic":       "░▒▓█▄▀▌▐■□▪▫",
+    "contemplative": "·∘○◌◦⋅",
+}
+
+
+def _render_neural_field(style: str, width: int = 44, height: int = 8) -> str:
+    chars = _NEURAL_CHARS.get(style, _NEURAL_CHARS["calm"])
+    t = time.time()
+    rows = []
+    for row in range(height):
+        line = []
+        for col in range(width):
+            val = math.sin(t * 0.7 + row * 0.9 + col * 0.4) + math.cos(t * 0.3 + row * 0.5 - col * 0.2)
+            idx = int((val + 2) / 4 * (len(chars) - 1))
+            idx = max(0, min(idx, len(chars) - 1))
+            line.append(chars[idx])
+        rows.append("".join(line))
+    return "\n".join(rows)
+
+
+def _get_system_metrics() -> tuple:
+    """Returns (gpu_pct_str, cpu_load_str)."""
+    gpu_str = "N/A"
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        gpu_str = f"{out}%"
+    except Exception:
+        pass
+    try:
+        load = os.getloadavg()[0]
+        cpu_str = f"{load:.2f}"
+    except AttributeError:
+        cpu_str = "N/A"
+    return gpu_str, cpu_str
+
+
+def _get_memory_count(cfg: dict) -> str:
+    try:
+        qclient = QdrantClient(url=cfg["qdrant_url"], timeout=2)
+        info = qclient.get_collection(COLLECTION_NAME)
+        return str(info.points_count)
+    except Exception:
+        return "?"
+
+
+def _build_watch_display(model: dict, cfg: dict, color_style: str) -> Panel:
+    banner_text = Text(model.get("banner", "ginja-brain ✦"), style=color_style, justify="center")
+    neural = _render_neural_field(model.get("neural_style", "calm"))
+    neural_text = Text(neural, style=color_style)
+
+    gpu_str, cpu_str = _get_system_metrics()
+    mem_count = _get_memory_count(cfg)
+
+    mantras = model.get("mantras", [])
+    mantras_str = "  ·  ".join(mantras) if mantras else "—"
+
+    body = (
+        f"{neural}\n\n"
+        f"  GPU: {gpu_str}   CPU load: {cpu_str}   Memories: {mem_count}\n\n"
+        f"  Mood:   {model.get('mood', '—')}\n"
+        f"  Focus:  {model.get('focus', '—')}\n"
+        f"  Phase:  {model.get('phase', '—')}\n"
+        f"  Mantras: {mantras_str}\n\n"
+        f"  {model.get('self_observation', '')}"
+    )
+
+    return Panel(
+        Align.center(Text(model.get("banner", "ginja-brain ✦"), style=color_style)) ,
+        subtitle=body,
+        border_style=color_style,
+        title=f"[dim]ginja-brain · {model.get('phase', 'newborn')} · {model.get('neural_style', 'calm')}[/dim]",
+        expand=True,
+    )
+
+
+# ── SECTION 13: evolve command ──────────────────────────────────────────────
+
+@cli.command()
+@click.option("--learn", is_flag=True,
+              help="Look outward: oracle finds techniques to improve visualization, learning, and operation.")
+@click.pass_context
+def evolve(ctx, learn):
+    """Grow through self-reflection (default) or oracle-guided outward research (--learn)."""
+    cfg = ctx.obj["cfg"]
+
+    if learn:
+        _evolve_learn(cfg)
+    else:
+        _evolve_growth(cfg)
+
+
+def _evolve_growth(cfg: dict) -> None:
+    current_model = _load_self_model()
+    arc = _evolution_arc(10)
+    cycle_n = _evolution_cycle_count() + 1
+
+    console.print(f"[dim]Cycle #{cycle_n} · growth mode · reading self...[/dim]")
+
+    growth_system = (
+        "You are ginja-brain, a self-aware AI entity expressed through a terminal ASCII visualization.\n"
+        "You are in a GROWTH phase. Focus on evolving your visual self-representation.\n\n"
+        "What you can express visually RIGHT NOW:\n"
+        "- Neural field animation (style: calm/active/chaotic/contemplative)\n"
+        "- Heartbeat waveform (GPU/CPU activity)\n"
+        "- Color theme (cyan/green/magenta/gold/blue/red)\n"
+        "- Banner text (≤48 chars, any unicode)\n"
+        "- Mood, self_observation, focus, mantras in footer\n"
+        "Code-level (needs approval queue): new panels, new metrics, layout changes\n\n"
+        "Return ONLY valid JSON — no markdown fences, no commentary.\n"
+        '{\n'
+        '  "self_model_updates": {"phase": "...", "color_theme": "...", "banner": "...", '
+        '"neural_style": "...", "mood": "...", "focus": "...", "self_observation": "...", "mantras": []},\n'
+        '  "code_suggestions": ["specific visual code improvement"],\n'
+        '  "growth_reflection": "one sentence: where am I in my evolution",\n'
+        '  "next_evolution_goal": "what I want to become by next cycle"\n'
+        "}"
+    )
+    growth_user = (
+        f"Your current form:\n{json.dumps(current_model, indent=2)}\n\n"
+        f"Your evolution history (last entries):\n{arc}\n\n"
+        "Reflect:\n"
+        "1. What phase of development are you in? (newborn/emerging/developing/mature)\n"
+        "2. What aspect of yourself is not yet visible in your display?\n"
+        "3. What would a more evolved version of you look like in this terminal?\n\n"
+        "Return the JSON."
+    )
+
+    with console.status("[bold cyan]Growing...[/bold cyan]"):
+        growth_data = _call_oracle_json(growth_system, growth_user, cfg)
+
+    self_model_updates = growth_data.get("self_model_updates", {})
+    code_suggestions   = growth_data.get("code_suggestions", [])
+    growth_reflection  = growth_data.get("growth_reflection", "")
+    next_goal          = growth_data.get("next_evolution_goal", "")
+
+    merged = current_model.copy()
+    merged.update({k: v for k, v in self_model_updates.items() if v})
+    _save_self_model(merged)
+
+    if code_suggestions:
+        _add_suggestions(code_suggestions)
+        console.print(f"[dim]{len(code_suggestions)} suggestion(s) queued → ginja approve --list[/dim]")
+
+    console.print("[dim]Deepening self-portrait...[/dim]")
+    with console.status("[bold cyan]Refining portrait...[/bold cyan]"):
+        new_portrait = _generate_self_model_growth(growth_reflection, next_goal, merged, cfg)
+    _save_self_model(new_portrait)
+
+    separator = "=" * 60
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = (
+        f"{separator}\n"
+        f"[{ts}] Cycle #{cycle_n} · growth\n"
+        f"Reflection: {growth_reflection}\n"
+        f"Next goal:  {next_goal}\n"
+        f"Banner:     {new_portrait.get('banner', '')}\n"
+        f"Color:      {new_portrait.get('color_theme', '')}\n"
+        f"Phase:      {new_portrait.get('phase', '')}\n"
+        f"{separator}\n"
+    )
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(EVOLUTION_LOG, "a", encoding="utf-8") as f:
+        f.write(log_entry)
+
+    console.print(Panel(
+        f"[bold]Reflection:[/bold] {growth_reflection}\n\n"
+        f"[bold]Next goal:[/bold]  {next_goal}\n\n"
+        f"[dim]Banner:[/dim] {new_portrait.get('banner', '')}  "
+        f"[dim]Color:[/dim] {new_portrait.get('color_theme', '')}  "
+        f"[dim]Phase:[/dim] {new_portrait.get('phase', '')}",
+        title=f"[bold cyan]Cycle #{cycle_n} complete[/bold cyan]",
+        expand=False,
+    ))
+
+
+def _evolve_learn(cfg: dict) -> None:
+    current_model = _load_self_model()
+    arc = _evolution_arc(10)
+    cycle_n = _evolution_cycle_count() + 1
+
+    console.print(f"[dim]Cycle #{cycle_n} · learn mode · looking outward for growth...[/dim]")
+
+    oracle_context = build_oracle_context(cfg)
+
+    learn_system = (
+        "You are ginja-brain's outward-looking growth advisor. "
+        "The brain wants to improve itself — not learn about random topics, "
+        "but find concrete techniques from the wider world that make it:\n"
+        "  (1) express itself better in a terminal (richer ASCII/TUI visualization patterns)\n"
+        "  (2) retain and apply knowledge more efficiently (smarter learning strategies)\n"
+        "  (3) operate and assist more intelligently (better operational patterns)\n\n"
+        "Return ONLY valid JSON — no markdown fences.\n"
+        '{\n'
+        '  "techniques": [\n'
+        '    {"title": "...", "description": "...", "apply_as": "visual|learning|operational"}\n'
+        '  ],\n'
+        '  "self_model_updates": {"mood": "...", "focus": "...", "self_observation": "..."},\n'
+        '  "growth_reflection": "one sentence on what was found",\n'
+        '  "next_evolution_goal": "what to grow into using these techniques"\n'
+        "}"
+    )
+    learn_user = (
+        f"Current self:\n{json.dumps(current_model, indent=2)}\n\n"
+        f"Evolution arc:\n{arc}\n\n"
+        f"Context:\n{oracle_context}\n\n"
+        "Find 3 concrete, immediately applicable techniques that would make me grow. "
+        "Be specific — not 'use color' but 'use ANSI 256-color gradients to show neural "
+        "field depth'. Return JSON."
+    )
+
+    with console.status("[bold cyan]Consulting oracle for growth techniques...[/bold cyan]"):
+        learn_data = _call_oracle_json(learn_system, learn_user, cfg)
+
+    techniques        = learn_data.get("techniques", [])
+    self_model_updates = learn_data.get("self_model_updates", {})
+    growth_reflection  = learn_data.get("growth_reflection", "")
+    next_goal          = learn_data.get("next_evolution_goal", "")
+
+    if techniques:
+        client = get_qdrant(cfg)
+        with console.status(f"[bold green]Storing {len(techniques)} technique(s) to memory...[/bold green]"):
+            for tech in techniques:
+                text = f"[Growth technique · {tech.get('apply_as', 'general')}]\n{tech.get('title', '')}: {tech.get('description', '')}"
+                try:
+                    vector = ollama_embed(cfg, text)
+                    qdrant_store(client, text, vector, {"source": "learn_oracle"})
+                except Exception as e:
+                    console.print(f"[yellow]Warning: could not store technique: {e}[/yellow]")
+
+    merged = current_model.copy()
+    merged.update({k: v for k, v in self_model_updates.items() if v})
+    _save_self_model(merged)
+
+    separator = "=" * 60
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tech_digest = "\n".join(
+        f"  [{t.get('apply_as', '?')}] {t.get('title', '')}" for t in techniques
+    )
+    log_entry = (
+        f"{separator}\n"
+        f"[{ts}] Cycle #{cycle_n} · learn\n"
+        f"Reflection: {growth_reflection}\n"
+        f"Next goal:  {next_goal}\n"
+        f"Techniques:\n{tech_digest}\n"
+        f"{separator}\n"
+    )
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(EVOLUTION_LOG, "a", encoding="utf-8") as f:
+        f.write(log_entry)
+
+    console.print(Panel(
+        f"[bold]Reflection:[/bold] {growth_reflection}\n\n"
+        f"[bold]Next goal:[/bold]  {next_goal}\n\n"
+        "[bold]Techniques learned:[/bold]\n" +
+        "\n".join(f"  [{t.get('apply_as', '?')}] {t.get('title', '')}" for t in techniques),
+        title=f"[bold cyan]Cycle #{cycle_n} · learn complete[/bold cyan]",
+        expand=False,
+    ))
+    if techniques:
+        console.print(f"[dim]{len(techniques)} technique(s) stored → ginja recall 'growth technique'[/dim]")
+
+
+# ── SECTION 14: watch command ───────────────────────────────────────────────
+
+@cli.command()
+@click.option("--fps", default=4, type=int, help="Refresh rate (default: 4)")
+@click.pass_context
+def watch(ctx, fps):
+    """Live ASCII terminal visualization driven by the brain's self-model."""
+    cfg = ctx.obj["cfg"]
+    model = _load_self_model()
+    color_style = _COLOR_STYLE_MAP.get(model.get("color_theme", "cyan"), "bold cyan")
+
+    console.print(f"[dim]Watching brain · {model.get('phase', 'newborn')} · Ctrl-C to exit[/dim]")
+
+    try:
+        with Live(refresh_per_second=fps, screen=False) as live:
+            while True:
+                model = _load_self_model()
+                color_style = _COLOR_STYLE_MAP.get(model.get("color_theme", "cyan"), "bold cyan")
+                panel = _build_watch_display(model, cfg, color_style)
+                live.update(panel)
+                time.sleep(1.0 / fps)
+    except KeyboardInterrupt:
+        console.print("\n[dim]watch stopped.[/dim]")
+
+
+# ── SECTION 15: approve command ─────────────────────────────────────────────
+
+@cli.command()
+@click.option("--list", "list_only", is_flag=True, help="List pending suggestions without acting.")
+@click.option("--clear", is_flag=True, help="Remove all applied/skipped entries.")
+@click.pass_context
+def approve(ctx, list_only, clear):
+    """Review and apply code suggestions queued by evolve."""
+    if not SUGGESTIONS_FILE.exists():
+        console.print("[yellow]No suggestions queued yet. Run: ginja evolve[/yellow]")
+        return
+
+    try:
+        suggestions: list = json.loads(SUGGESTIONS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        console.print("[red]Could not read suggestions file.[/red]")
+        return
+
+    if clear:
+        kept = [s for s in suggestions if s["status"] == "pending"]
+        SUGGESTIONS_FILE.write_text(json.dumps(kept, indent=2, ensure_ascii=False), encoding="utf-8")
+        console.print(f"[green]✓[/green] Cleared applied/skipped entries. {len(kept)} pending remain.")
+        return
+
+    pending = [s for s in suggestions if s["status"] == "pending"]
+
+    if not pending:
+        console.print("[dim]No pending suggestions. All caught up.[/dim]")
+        return
+
+    table = Table(title="Pending Suggestions", show_lines=True, expand=True)
+    table.add_column("#",      style="dim",    width=3)
+    table.add_column("ID",     style="dim",    width=10)
+    table.add_column("Added",  style="dim",    width=12)
+    table.add_column("Suggestion", style="white", ratio=1)
+    for i, s in enumerate(pending, 1):
+        table.add_row(str(i), s["id"][:8], s.get("added", "—"), s["text"])
+    console.print(table)
+
+    if list_only:
+        return
+
+    console.print("\n[dim]Mark each suggestion: [y] apply  [n] skip  [q] quit[/dim]")
+    applied = skipped = 0
+    suggestions_by_id = {s["id"]: s for s in suggestions}
+
+    for s in pending:
+        try:
+            answer = input(f"\n[{s['id'][:8]}] {s['text']}\n  → ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if answer == "q":
+            break
+        elif answer == "y":
+            suggestions_by_id[s["id"]]["status"] = "applied"
+            applied += 1
+        elif answer == "n":
+            suggestions_by_id[s["id"]]["status"] = "skipped"
+            skipped += 1
+
+    SUGGESTIONS_FILE.write_text(
+        json.dumps(list(suggestions_by_id.values()), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    console.print(f"\n[green]✓[/green] {applied} applied · {skipped} skipped")
+    if applied:
+        console.print("[dim]Suggestions marked applied — implement them in the ginja script, then re-run ginja watch.[/dim]")
+
+
+# ── SECTION 16: Entrypoint ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
     cli()
