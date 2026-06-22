@@ -85,6 +85,9 @@ DEFAULT_CONFIG: dict = {
     "code_model":    "qwen2.5-coder:7b",
     "gemini_model":  "gemini/gemini-1.5-flash",
     "gemini_api_key": None,
+    "anthropic_api_key": None,
+    "oracle_provider":   "gemini",                    # cheaper; Gemini key already in env
+    "oracle_model":      "claude-haiku-4-5-20251001", # used only when provider=anthropic
     "top_k":         5,
     "serve_port":    8765,
     "persona_file":  str(PERSONA_FILE),
@@ -96,6 +99,9 @@ _ENV_MAP = {
     "GINJA_QDRANT_API_KEY": "qdrant_api_key",
     "GINJA_GEMINI_API_KEY": "gemini_api_key",
     "GEMINI_API_KEY":       "gemini_api_key",
+    "ANTHROPIC_API_KEY":    "anthropic_api_key",
+    "GINJA_ORACLE_PROVIDER": "oracle_provider",
+    "GINJA_ORACLE_MODEL":   "oracle_model",
     "GINJA_TOP_K":          "top_k",
     "GINJA_DEFAULT_MODEL":  "default_model",
 }
@@ -212,6 +218,104 @@ def ollama_generate_gemini(cfg: dict, messages: list) -> str:
         return response.choices[0].message.content
     except Exception as e:
         raise click.ClickException(f"Gemini generation failed: {e}")
+
+
+def build_oracle_context(cfg: dict) -> str:
+    """Package persona + recent memories for the oracle's system prompt."""
+    parts = []
+    persona_path = pathlib.Path(cfg.get("persona_file", str(PERSONA_FILE)))
+    if persona_path.exists():
+        parts.append("## Persona\n" + persona_path.read_text(encoding="utf-8").strip())
+    try:
+        client = get_qdrant(cfg)
+        ensure_collection(client)
+        scroll_result = client.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=100,
+            with_payload=True,
+            with_vectors=False,
+        )
+        points = sorted(
+            scroll_result[0],
+            key=lambda p: (p.payload or {}).get("timestamp", ""),
+            reverse=True,
+        )[:20]
+        if points:
+            mem_lines = [
+                f"[{(p.payload or {}).get('timestamp', '')[:10]} | "
+                f"{(p.payload or {}).get('source', '?')}] "
+                f"{textwrap.shorten((p.payload or {}).get('text', ''), 200)}"
+                for p in points
+            ]
+            parts.append("## Recent Memories\n" + "\n".join(mem_lines))
+    except Exception:
+        pass  # non-fatal — persona alone is still useful
+    return "\n\n".join(parts)
+
+
+_ORACLE_FORMAT_INSTRUCTION = (
+    "\n\nRESPONSE FORMAT: Token-optimized output only. Use structured headings, bullet points, "
+    "and dense factual prose. No conversational filler, no hedging, no padding. Write as a "
+    "technical knowledge base entry. Every token must carry information."
+)
+
+
+def ask_oracle(system_prompt: str, user_question: str, cfg: dict) -> str:
+    """Call the cloud oracle (Gemini or Anthropic). Streams to stdout, returns full response."""
+    full_system = system_prompt + _ORACLE_FORMAT_INSTRUCTION
+    provider = cfg.get("oracle_provider", "gemini")
+
+    if provider == "anthropic":
+        try:
+            import anthropic
+        except ImportError:
+            raise click.ClickException("Oracle (anthropic) requires: pip install anthropic")
+        api_key = cfg.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise click.ClickException(
+                "Anthropic oracle requires an API key.\n"
+                "Set ANTHROPIC_API_KEY env var or add anthropic_api_key to ~/.ginja/config.yaml."
+            )
+        model = cfg.get("oracle_model", "claude-haiku-4-5-20251001")
+        console.print(f"[dim]Model: {model} (oracle·anthropic)[/dim]")
+        client_a = anthropic.Anthropic(api_key=api_key)
+        parts: list[str] = []
+        with client_a.messages.stream(
+            model=model,
+            max_tokens=2048,
+            system=full_system,
+            messages=[{"role": "user", "content": user_question}],
+        ) as stream:
+            for text in stream.text_stream:
+                print(text, end="", flush=True)
+                parts.append(text)
+        print()
+        return "".join(parts)
+
+    else:  # gemini via litellm — consistent with existing --hard path
+        try:
+            import litellm
+        except ImportError:
+            raise click.ClickException("Oracle (gemini) requires: pip install litellm")
+        api_key = cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise click.ClickException(
+                "Gemini oracle requires an API key.\n"
+                "Set GINJA_GEMINI_API_KEY env var or add gemini_api_key to ~/.ginja/config.yaml."
+            )
+        oracle_model = "gemini/gemini-1.5-pro"
+        console.print(f"[dim]Model: {oracle_model} (oracle·gemini)[/dim]")
+        resp = litellm.completion(
+            model=oracle_model,
+            messages=[
+                {"role": "system", "content": full_system},
+                {"role": "user",   "content": user_question},
+            ],
+            api_key=api_key,
+        )
+        result = resp.choices[0].message.content
+        console.print(result)
+        return result
 
 
 # ── SECTION 4: Qdrant Client ────────────────────────────────────────────────
@@ -470,12 +574,23 @@ def print_status_panel(ollama_data: dict, qdrant_data: dict, cfg: dict) -> None:
         count = qdrant_data.get("collection_count", "?")
         lines.append(f"[green]Qdrant:[/green]  ✓  {count} points in '{COLLECTION_NAME}'")
 
+    provider = cfg.get("oracle_provider", "gemini")
+    o_model  = cfg.get("oracle_model", "claude-haiku-4-5-20251001")
+    has_key  = bool(
+        (cfg.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY"))
+        if provider == "anthropic"
+        else (cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY"))
+    )
+    key_icon = "[green]✓ key set[/green]" if has_key else "[red]no key[/red]"
+    oracle_label = f"{provider}:{o_model}" if provider == "anthropic" else f"{provider}:gemini-1.5-pro"
+
     lines += [
         "",
         f"[dim]Embed model  [/dim] {cfg['embed_model']}",
         f"[dim]Fast model   [/dim] {cfg['fast_model']}",
         f"[dim]Default model[/dim] {cfg['default_model']}",
         f"[dim]Code model   [/dim] {cfg['code_model']}",
+        f"[dim]Oracle       [/dim] {oracle_label}  {key_icon}",
         f"[dim]Top-k RAG    [/dim] {cfg['top_k']}",
         f"[dim]Serve port   [/dim] {cfg['serve_port']}",
         f"[dim]Persona file [/dim] {cfg.get('persona_file', str(PERSONA_FILE))}",
@@ -500,15 +615,37 @@ def cli(ctx):
 @click.option("--fast",   "-f", is_flag=True, help="Use fast model (llama3.2:3b)")
 @click.option("--code",   "-c", is_flag=True, help="Use code model (qwen2.5-coder:7b)")
 @click.option("--hard",         is_flag=True, help="Use Gemini fallback (requires API key)")
+@click.option("--oracle", "-o", is_flag=True, help="Use cloud oracle — local models exhausted? Use when local has already failed.")
 @click.option("--no-rag",       is_flag=True, help="Skip RAG memory injection")
 @click.option("--top-k", "top_k", type=int, default=None, help="Memories to retrieve (overrides config)")
 @click.option("--model",  "-m", default=None, help="Override model directly")
 @click.pass_context
-def ask(ctx, question, fast, code, hard, no_rag, top_k, model):
+def ask(ctx, question, fast, code, hard, oracle, no_rag, top_k, model):
     """One-shot question with streaming output and RAG context."""
     cfg = ctx.obj["cfg"]
     if top_k is not None:
         cfg["top_k"] = top_k
+
+    if oracle:
+        console.print("[dim][oracle] Cloud API call — costs money. Local models exhausted? Proceeding...[/dim]")
+        context = ""
+        if not no_rag:
+            context, _ = build_rag_context(cfg, question)
+        persona_path = pathlib.Path(cfg.get("persona_file", str(PERSONA_FILE)))
+        persona = (
+            persona_path.read_text(encoding="utf-8").strip()
+            if persona_path.exists()
+            else "You are a helpful personal assistant named Ginja."
+        )
+        system_parts = [persona]
+        if context:
+            system_parts.append(context)
+        system_parts.append(
+            "The user has determined local models are insufficient for this question. "
+            "Answer with depth and precision."
+        )
+        ask_oracle("\n\n".join(system_parts), question, cfg)
+        return
 
     chosen = model or route_model(cfg, question, fast=fast, code=code, hard=hard)
     context = ""
@@ -704,6 +841,50 @@ def status(ctx):
             qdrant_data = {"error": str(e)}
 
     print_status_panel(ollama_data, qdrant_data, cfg)
+
+
+# ── counsel ───────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("question")
+@click.option("--save", "-s", is_flag=True,
+              help="Store oracle response to memory so ginja learns from it.")
+@click.option("--no-context", "no_context", is_flag=True,
+              help="Skip persona/memory context (faster, cheaper).")
+@click.pass_context
+def counsel(ctx, question, save, no_context):
+    """Ask the cloud oracle for guidance — last resort when local models have failed.
+
+    Try 'ginja ask' and 'ginja recall' first. The oracle teaches; use --save to store
+    its answer so ginja learns and won't need to ask again.
+    """
+    cfg = ctx.obj["cfg"]
+    console.print("[dim][oracle] Cloud API call — costs money. Local models exhausted? Proceeding...[/dim]")
+
+    system = (
+        "You are a senior technical guide for ginja-brain, a local AI assistant running on "
+        "constrained hardware (4GB VRAM, 3–7B parameter models). Its local resources could not "
+        "adequately answer the question below. Explain clearly and teach — your response will be "
+        "stored as a memory so ginja learns and won't need to ask again. Factor in its hardware "
+        "constraints when suggesting tools, models, or techniques."
+    )
+
+    if not no_context:
+        context = build_oracle_context(cfg)
+        if context:
+            system += "\n\nHere is its full context:\n\n" + context
+
+    response = ask_oracle(system, question, cfg)
+
+    if save:
+        try:
+            with console.status("[bold green]Saving oracle response to memory..."):
+                vector = ollama_embed(cfg, response)
+                client = get_qdrant(cfg)
+                qdrant_store(client, response, vector, {"source": "oracle"})
+            console.print("[green]✓[/green] Oracle response saved to memory.")
+        except Exception as e:
+            console.print(f"[yellow]Warning: could not save to memory: {e}[/yellow]")
 
 
 # ── context (called by cd hook) ───────────────────────────────────────────────
