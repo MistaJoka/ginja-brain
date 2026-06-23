@@ -68,6 +68,10 @@ fi
 cp "$REPO_DIR/shell/ginja.bashrc" "$GINJA_DIR/shell.bashrc"
 echo "    Installed ~/.ginja/shell.bashrc"
 
+cp "$REPO_DIR/shell/auto-evolve.sh" "$GINJA_DIR/auto-evolve.sh"
+chmod +x "$GINJA_DIR/auto-evolve.sh"
+echo "    Installed ~/.ginja/auto-evolve.sh"
+
 SHELL_LINE='[ -f "$HOME/.ginja/shell.bashrc" ] && source "$HOME/.ginja/shell.bashrc"'
 BASHRC="$HOME/.bashrc"
 
