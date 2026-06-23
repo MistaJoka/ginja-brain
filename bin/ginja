@@ -1,0 +1,2059 @@
+#!/usr/bin/env python3
+"""ginja — Your AI extension CLI."""
+
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import click
+from rich.align import Align
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+GINJA_DIR = Path.home() / ".ginja"
+CONFIG_FILE = GINJA_DIR / "config.json"
+PERSONA_FILE = GINJA_DIR / "persona.md"
+CONTEXT_FILE = GINJA_DIR / ".context"
+
+DEFAULT_CONFIG = {
+    "primary_model": "gemma3:4b",
+    "code_model": "qwen2.5-coder:3b",
+    "fast_model": "llama3.2:3b",
+    "quality_model": "mistral:7b",
+    "embed_model": "nomic-embed-text",
+    "ollama_url": "http://localhost:11434",
+    "qdrant_url": "http://localhost:6333",
+    "searxng_url": "http://localhost:8080",
+    "gemini_api_key": "",
+    "gemini_model": "gemini-1.5-flash",
+    "gemini_pro_model": "gemini-1.5-pro",
+    "use_gemini_fallback": False,
+    "gemini_for_evolve": True,
+    "gemini_for_implement": True,
+    "top_k_memories": 5,
+    "save_conversations": True,
+    "num_ctx": 2048,
+}
+
+CODE_KEYWORDS = {
+    "code", "function", "bug", "error", "fix", "implement", "syntax",
+    "class", "method", "import", "module", "python", "bash", "javascript",
+    "typescript", "docker", "yaml", "json", "sql", "api", "endpoint", "debug",
+    "refactor", "script", "def ", "return ", "git", "grep", "chmod",
+    "variable", "loop", "array", "string", "integer", "parse", "regex",
+}
+
+INGEST_EXTENSIONS = {
+    ".md", ".txt", ".rst", ".org",
+    ".py", ".js", ".ts", ".sh", ".bash",
+    ".yaml", ".yml", ".toml", ".json",
+    ".html", ".css",
+    ".csv", ".log",
+    ".pdf",
+}
+
+console = Console()
+
+_gemini_unavailable: bool = False  # set True within a session when API returns quota/auth errors
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        GINJA_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
+    with open(CONFIG_FILE) as f:
+        cfg = json.load(f)
+    for k, v in DEFAULT_CONFIG.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+def load_persona() -> str:
+    return PERSONA_FILE.read_text().strip() if PERSONA_FILE.exists() else ""
+
+
+def load_context() -> str:
+    return CONTEXT_FILE.read_text().strip() if CONTEXT_FILE.exists() else ""
+
+
+# ── Qdrant helpers ─────────────────────────────────────────────────────────────
+def get_qdrant(cfg: dict):
+    from qdrant_client import QdrantClient
+    return QdrantClient(url=cfg["qdrant_url"], timeout=10)
+
+
+def ensure_collections(client, vector_size: int = 768):
+    from qdrant_client.models import Distance, VectorParams
+    existing = {c.name for c in client.get_collections().collections}
+    for name in ("memories", "documents", "conversations"):
+        if name not in existing:
+            client.create_collection(
+                collection_name=name,
+                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+            )
+
+
+def embed(text: str, cfg: dict) -> list:
+    import ollama
+    resp = ollama.embeddings(model=cfg["embed_model"], prompt=text)
+    return resp["embedding"]
+
+
+def store_memory(text: str, cfg: dict, collection: str = "memories", source: str = ""):
+    from qdrant_client.models import PointStruct
+    client = get_qdrant(cfg)
+    vec = embed(text, cfg)
+    ensure_collections(client, len(vec))
+    client.upsert(
+        collection_name=collection,
+        points=[PointStruct(
+            id=str(uuid.uuid4()),
+            vector=vec,
+            payload={
+                "text": text,
+                "source": source,
+                "created": datetime.now(timezone.utc).isoformat(),
+            },
+        )],
+    )
+
+
+def search_memory(query: str, cfg: dict, top_k: int = 5) -> list:
+    client = get_qdrant(cfg)
+    vec = embed(query, cfg)
+    results = []
+    for collection in ("memories", "documents", "conversations"):
+        try:
+            for hit in client.search(collection_name=collection, query_vector=vec, limit=top_k):
+                results.append({
+                    "id": str(hit.id),
+                    "score": hit.score,
+                    "collection": collection,
+                    "text": hit.payload.get("text", ""),
+                    "source": hit.payload.get("source", ""),
+                    "created": hit.payload.get("created", ""),
+                })
+        except Exception:
+            pass
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+
+
+# ── File reading (with PDF support) ───────────────────────────────────────────
+def read_file(file_path: Path) -> str:
+    if file_path.suffix.lower() == ".pdf":
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(str(file_path))
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as e:
+            console.print(f"[yellow]PDF read warning: {e}[/yellow]")
+            return ""
+    return file_path.read_text(encoding="utf-8", errors="ignore")
+
+
+# ── Chunking ───────────────────────────────────────────────────────────────────
+def chunk_text(text: str, char_size: int, char_overlap: int) -> list:
+    chunks, start = [], 0
+    while start < len(text):
+        end = min(start + char_size, len(text))
+        if end < len(text):
+            nl = text.rfind("\n", start, end)
+            if nl > start + char_size // 2:
+                end = nl
+        chunk = text[start:end].strip()
+        if len(chunk) > 50:
+            chunks.append(chunk)
+        start = end - char_overlap
+    return chunks
+
+
+def ingest_file(file_path: Path, cfg: dict, char_size: int, char_overlap: int) -> int:
+    try:
+        text = read_file(file_path)
+    except Exception:
+        return 0
+    if not text.strip():
+        return 0
+    chunks = chunk_text(text, char_size, char_overlap)
+    for chunk in chunks:
+        store_memory(chunk, cfg, collection="documents", source=str(file_path))
+    return len(chunks)
+
+
+# ── Model router ───────────────────────────────────────────────────────────────
+def pick_model(query: str, cfg: dict) -> str:
+    q = query.lower()
+    if any(kw in q for kw in CODE_KEYWORDS):
+        return cfg["code_model"]
+    if len(query) < 80:
+        return cfg["fast_model"]
+    return cfg["primary_model"]
+
+
+# ── Shell context ──────────────────────────────────────────────────────────────
+def shell_context() -> str:
+    cwd = os.getcwd()
+    git_branch = ""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, cwd=cwd, timeout=2,
+        )
+        if r.returncode == 0:
+            git_branch = r.stdout.strip()
+    except Exception:
+        pass
+    ctx = f"Current directory: {cwd}"
+    if git_branch:
+        ctx += f"\nGit branch: {git_branch}"
+    project_ctx = load_context()
+    if project_ctx and project_ctx != cwd:
+        ctx += f"\nProject context: {project_ctx}"
+    return ctx
+
+
+# ── Prompt builder ─────────────────────────────────────────────────────────────
+def build_prompt(query: str, persona: str, memories: list, ctx: str) -> str:
+    parts = []
+    if persona:
+        parts.append(f"## About me\n{persona}")
+    if ctx:
+        parts.append(f"## Current context\n{ctx}")
+    if memories:
+        mem_lines = "\n".join(f"- [{m['collection']}] {m['text']}" for m in memories)
+        parts.append(f"## Relevant memories from my brain\n{mem_lines}")
+    parts.append(f"## My question\n{query}")
+    return "\n\n".join(parts)
+
+
+# ── Ollama streaming ───────────────────────────────────────────────────────────
+def ollama_stream(prompt: str, model: str, messages: list = None, num_ctx: int = 2048) -> str:
+    import ollama
+    full = ""
+    if messages is None:
+        messages = [{"role": "user", "content": prompt}]
+    try:
+        for chunk in ollama.chat(
+            model=model,
+            messages=messages,
+            stream=True,
+            options={"num_ctx": num_ctx},
+        ):
+            token = chunk["message"]["content"]
+            print(token, end="", flush=True)
+            full += token
+        print()
+        return full
+    except Exception as e:
+        console.print(f"\n[red]Ollama error ({model}): {e}[/red]")
+        return ""
+
+
+def ollama_complete(prompt: str, model: str, cfg: dict) -> str:
+    import ollama
+    try:
+        resp = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            options={"num_ctx": cfg.get("num_ctx", 2048)},
+        )
+        return resp["message"]["content"]
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+def ask_with_fallback(prompt: str, cfg: dict, model: str) -> str:
+    num_ctx = cfg.get("num_ctx", 2048)
+    fallback_chain = [model]
+    if model != cfg["fast_model"]:
+        fallback_chain.append(cfg["fast_model"])
+    for m in fallback_chain:
+        console.print(f"[dim]model: {m}[/dim]")
+        result = ollama_stream(prompt, m, num_ctx=num_ctx)
+        if result:
+            return result
+    if cfg.get("use_gemini_fallback") and cfg.get("gemini_api_key"):
+        return ask_gemini(prompt, cfg)
+    console.print("[red]All models failed. Is Ollama running?[/red]")
+    return ""
+
+
+def gemini_available(cfg: dict) -> bool:
+    return bool(cfg.get("gemini_api_key", "").strip())
+
+
+def gemini_complete(prompt: str, cfg: dict, pro: bool = False, stream: bool = False) -> str:
+    """Call Gemini API using google-genai SDK."""
+    global _gemini_unavailable
+    try:
+        from google import genai
+        client = genai.Client(api_key=cfg["gemini_api_key"])
+        model_name = cfg.get("gemini_pro_model", "gemini-2.0-flash") if pro \
+                     else cfg.get("gemini_model", "gemini-2.0-flash")
+        console.print(f"[dim]model: {model_name}[/dim]")
+        if stream:
+            full = ""
+            for chunk in client.models.generate_content_stream(
+                model=model_name, contents=prompt
+            ):
+                token = chunk.text or ""
+                print(token, end="", flush=True)
+                full += token
+            print()
+            return full
+        else:
+            resp = client.models.generate_content(model=model_name, contents=prompt)
+            return resp.text or ""
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "RESOURCE_EXHAUSTED" in err or "spending cap" in err or "quota" in err.lower():
+            _gemini_unavailable = True
+            console.print("[yellow]⚠ Gemini quota exceeded — switching to local AI for this session[/yellow]")
+        elif any(code in err for code in ("401", "403")) or "API_KEY" in err.upper() or "UNAUTHENTICATED" in err:
+            _gemini_unavailable = True
+            console.print("[yellow]⚠ Gemini auth error — switching to local AI for this session[/yellow]")
+        else:
+            console.print(f"[red]Gemini error: {e}[/red]")
+        return ""
+
+
+def smart_complete(prompt: str, cfg: dict, use_case: str = "general",
+                   pro: bool = False, fallback_model: str = None) -> str:
+    """Route to Gemini or Ollama based on use_case and config.
+
+    use_case values:
+      'evolve'    — self-reflection / growth (prefers Gemini if gemini_for_evolve)
+      'implement' — code generation (prefers Gemini if gemini_for_implement)
+      'general'   — follows use_gemini_fallback setting
+    """
+    global _gemini_unavailable
+    model = fallback_model or cfg.get("quality_model", cfg["primary_model"])
+
+    if not _gemini_unavailable:
+        if use_case == "evolve" and cfg.get("gemini_for_evolve") and gemini_available(cfg):
+            result = gemini_complete(prompt, cfg, pro=pro)
+            if result:
+                return result
+        elif use_case == "implement" and cfg.get("gemini_for_implement") and gemini_available(cfg):
+            result = gemini_complete(prompt, cfg, pro=True)
+            if result:
+                return result
+        elif use_case == "general" and cfg.get("use_gemini_fallback") and gemini_available(cfg):
+            result = gemini_complete(prompt, cfg, pro=pro, stream=True)
+            if result:
+                return result
+
+    return ollama_complete(prompt, model, cfg)
+
+
+def ask_gemini(prompt: str, cfg: dict) -> str:
+    """Legacy streaming ask — kept for backward compat with ask command fallback."""
+    return gemini_complete(prompt, cfg, pro=False, stream=True)
+
+
+# ── Web helpers ────────────────────────────────────────────────────────────────
+def searxng_search(query: str, cfg: dict, num_results: int = 5) -> list:
+    import requests
+    url = cfg.get("searxng_url", "http://localhost:8080")
+    try:
+        resp = requests.get(
+            f"{url}/search",
+            params={"q": query, "format": "json"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("results", [])[:num_results]
+    except Exception as e:
+        console.print(f"[red]SearXNG error: {e}[/red]")
+        console.print("[dim]Is SearXNG running? docker compose up -d searxng[/dim]")
+        return []
+
+
+def fetch_page_text(url: str, max_chars: int = 8000) -> str:
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        resp = requests.get(url, timeout=4, headers={"User-Agent": "ginja/1.0"})
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+def scroll_recent(client, collection: str, days: int = 7) -> list:
+    """Return recent entries from a Qdrant collection within N days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        results, _ = client.scroll(collection_name=collection, limit=500, with_payload=True)
+        return [
+            r.payload for r in results
+            if r.payload.get("created", "0") >= cutoff
+        ]
+    except Exception:
+        return []
+
+
+def research_topic(t: str, cfg: dict, depth: int = 3, pages: int = 5, fetch: bool = False) -> str:
+    """Core research logic — returns summary string. Used by both research and evolve commands."""
+    query_prompt = (
+        f"Generate {depth} different search queries to thoroughly research: {t}\n"
+        "Return ONLY the queries, one per line, no numbering."
+    )
+    queries_raw = ollama_complete(query_prompt, cfg["fast_model"], cfg)
+    queries = [q.strip() for q in queries_raw.strip().splitlines() if q.strip()][:depth]
+    if not queries:
+        queries = [t]
+
+    all_text = []
+    total_ingested = 0
+    for query in queries:
+        console.print(f"  [dim]→ {query}[/dim]")
+        hits = searxng_search(query, cfg, num_results=pages)
+        for hit in hits:
+            url = hit.get("url", "")
+            snippet = hit.get("content", "") or hit.get("title", "")
+            if not url:
+                continue
+            if fetch:
+                page_text = fetch_page_text(url)
+                text = page_text if page_text else f"Title: {hit.get('title','')}\n{snippet}"
+            else:
+                text = f"Title: {hit.get('title','')}\nURL: {url}\nSummary: {snippet}"
+            if text:
+                all_text.append(f"Source: {url}\n{text[:2000]}")
+                total_ingested += 1
+
+    if not all_text:
+        return ""
+
+    combined = "\n\n---\n\n".join(all_text[:8])
+    summary_prompt = (
+        f"I researched: {t}\n\nHere is what I found:\n\n{combined}\n\n"
+        "Summarize the key findings. Be specific and technical. "
+        "Highlight anything surprising or especially useful."
+    )
+    summary = ollama_complete(summary_prompt, cfg["primary_model"], cfg)
+    console.print(f"  [green]✓[/green] {total_ingested} sources ingested")
+    return summary
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+@click.group()
+def cli():
+    """ginja — Your AI extension."""
+    pass
+
+
+@cli.command()
+@click.argument("query", nargs=-1, required=True)
+@click.option("--model", "-m", default=None, help="Override model")
+@click.option("--fast", "-f", is_flag=True, help="Force fast 3B model (100% GPU)")
+@click.option("--quality", "-q", is_flag=True, help="Force quality 7B model")
+@click.option("--no-memory", is_flag=True, help="Skip memory retrieval")
+def ask(query, model, fast, quality, no_memory):
+    """Ask anything — streams the answer and saves to memory."""
+    cfg = load_config()
+    q = " ".join(query)
+    if model:
+        chosen = model
+    elif fast:
+        chosen = cfg["fast_model"]
+    elif quality:
+        chosen = cfg.get("quality_model", "mistral:7b")
+    else:
+        chosen = pick_model(q, cfg)
+
+    memories = []
+    if not no_memory:
+        try:
+            memories = search_memory(q, cfg, top_k=cfg["top_k_memories"])
+        except Exception:
+            pass
+
+    prompt = build_prompt(q, load_persona(), memories, shell_context())
+    response = ask_with_fallback(prompt, cfg, chosen)
+
+    if cfg.get("save_conversations") and response:
+        try:
+            store_memory(
+                f"Q: {q[:200]}\nA: {response[:500]}",
+                cfg, collection="conversations", source="ask",
+            )
+        except Exception:
+            pass
+
+
+@cli.command()
+@click.argument("fact", nargs=-1, required=True)
+def remember(fact):
+    """Save a fact to your persistent memory."""
+    cfg = load_config()
+    text = " ".join(fact)
+    try:
+        store_memory(text, cfg, collection="memories", source="user")
+        console.print(f"[green]Remembered:[/green] {text}")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        console.print("[dim]Is Qdrant running? Check with: ginja status[/dim]")
+
+
+@cli.command()
+@click.argument("query", nargs=-1, required=True)
+@click.option("--top", "-n", default=10, help="Number of results")
+def recall(query, top):
+    """Search your memory semantically."""
+    cfg = load_config()
+    q = " ".join(query)
+    try:
+        results = search_memory(q, cfg, top_k=top)
+        if not results:
+            console.print("[yellow]No relevant memories found.[/yellow]")
+            return
+        table = Table(title=f'Memory: "{q}"', show_lines=True)
+        table.add_column("Score", style="cyan", width=6)
+        table.add_column("Source", style="magenta", width=14)
+        table.add_column("Content", style="white")
+        for r in results:
+            table.add_row(
+                f"{r['score']:.2f}",
+                r["collection"],
+                r["text"][:120] + ("…" if len(r["text"]) > 120 else ""),
+            )
+        console.print(table)
+    except Exception as e:
+        console.print(f"[red]Recall error: {e}[/red]")
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--chunk-size", default=500, help="Approx tokens per chunk")
+@click.option("--overlap", default=50, help="Token overlap between chunks")
+@click.option("--ext", multiple=True, help="Extra extensions e.g. --ext .epub")
+def ingest(path, chunk_size, overlap, ext):
+    """Ingest a file or directory (recursive) into your document memory."""
+    cfg = load_config()
+    target = Path(path).resolve()
+    char_size = chunk_size * 3 // 2
+    char_overlap = overlap * 3 // 2
+    allowed = INGEST_EXTENSIONS | {e if e.startswith(".") else f".{e}" for e in ext}
+
+    if target.is_file():
+        files = [target]
+    else:
+        files = [
+            f for f in target.rglob("*")
+            if f.is_file()
+            and f.suffix.lower() in allowed
+            and not any(part.startswith(".") for part in f.parts)
+        ]
+        if not files:
+            console.print(f"[yellow]No ingestible files found in {target}[/yellow]")
+            console.print(f"[dim]Supported: {', '.join(sorted(allowed))}[/dim]")
+            return
+        console.print(f"[cyan]Found {len(files)} files to ingest from {target}[/cyan]")
+
+    total_chunks, failed = 0, 0
+    try:
+        for f in files:
+            with console.status(f"[cyan]{f.name}…[/cyan]"):
+                n = ingest_file(f, cfg, char_size, char_overlap)
+            if n:
+                rel = f.relative_to(target.parent) if target.is_dir() else f.name
+                console.print(f"  [green]✓[/green] {rel} — {n} chunks")
+                total_chunks += n
+            else:
+                console.print(f"  [dim]skipped {f.name} (empty or unreadable)[/dim]")
+                failed += 1
+    except Exception as e:
+        console.print(f"[red]Ingest error: {e}[/red]")
+        return
+
+    console.print(
+        f"\n[bold green]✓ Done — {total_chunks} chunks from "
+        f"{len(files) - failed} files ingested[/bold green]"
+    )
+
+
+@cli.command()
+@click.argument("keyword", nargs=-1, required=True)
+@click.option("--force", is_flag=True, help="Delete without confirmation prompt")
+def forget(keyword, force):
+    """Remove memories matching a keyword (shows matches, asks to confirm)."""
+    cfg = load_config()
+    q = " ".join(keyword)
+    try:
+        results = search_memory(q, cfg, top_k=20)
+        if not results:
+            console.print("[yellow]No matching memories found.[/yellow]")
+            return
+
+        table = Table(title=f'Matches for "{q}"', show_lines=True)
+        table.add_column("#", style="dim", width=3)
+        table.add_column("Score", style="cyan", width=6)
+        table.add_column("Source", style="magenta", width=13)
+        table.add_column("Content", style="white")
+        for i, r in enumerate(results):
+            table.add_row(
+                str(i + 1),
+                f"{r['score']:.2f}",
+                r["collection"],
+                r["text"][:100] + ("…" if len(r["text"]) > 100 else ""),
+            )
+        console.print(table)
+
+        if not force:
+            confirm = console.input(
+                f"\n[yellow]Delete all {len(results)} matches? (yes/no):[/yellow] "
+            ).strip().lower()
+            if confirm not in ("yes", "y"):
+                console.print("[dim]Cancelled.[/dim]")
+                return
+
+        client = get_qdrant(cfg)
+        deleted = 0
+        by_collection: dict = {}
+        for r in results:
+            by_collection.setdefault(r["collection"], []).append(r["id"])
+        for coll, ids in by_collection.items():
+            client.delete(collection_name=coll, points_selector=ids)
+            deleted += len(ids)
+        console.print(f"[green]✓ Deleted {deleted} memories.[/green]")
+    except Exception as e:
+        console.print(f"[red]Forget error: {e}[/red]")
+
+
+@cli.command()
+@click.option("--days", default=30, help="Delete conversations older than N days")
+@click.option("--collection", default="conversations",
+              type=click.Choice(["conversations", "documents", "memories", "all"]),
+              help="Which collection to prune")
+def prune(days, collection):
+    """Remove old entries from memory to keep the brain sharp."""
+    cfg = load_config()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        from qdrant_client.models import Filter, FieldCondition, Range
+        client = get_qdrant(cfg)
+        collections = (
+            ["conversations", "documents", "memories"]
+            if collection == "all"
+            else [collection]
+        )
+        total = 0
+        for coll in collections:
+            try:
+                # Scroll through and find old entries
+                results, _ = client.scroll(
+                    collection_name=coll,
+                    scroll_filter=None,
+                    limit=10000,
+                    with_payload=True,
+                )
+                old_ids = [
+                    str(r.id) for r in results
+                    if r.payload.get("created", "9999") < cutoff
+                ]
+                if old_ids:
+                    client.delete(collection_name=coll, points_selector=old_ids)
+                    console.print(f"  [green]✓[/green] {coll}: removed {len(old_ids)} entries")
+                    total += len(old_ids)
+                else:
+                    console.print(f"  [dim]•[/dim] {coll}: nothing older than {days} days")
+            except Exception as e:
+                console.print(f"  [red]✗[/red] {coll}: {e}")
+        console.print(f"\n[bold green]Pruned {total} total entries[/bold green]")
+    except Exception as e:
+        console.print(f"[red]Prune error: {e}[/red]")
+
+
+@cli.command()
+def memories():
+    """Show memory stats — counts, age, and health of each collection."""
+    cfg = load_config()
+    try:
+        client = get_qdrant(cfg)
+        table = Table(title="Brain Memory Stats", show_lines=True)
+        table.add_column("Collection", style="cyan")
+        table.add_column("Vectors", style="white", justify="right")
+        table.add_column("Oldest", style="dim")
+        table.add_column("Newest", style="dim")
+        table.add_column("Health", style="white")
+
+        for coll in ("memories", "documents", "conversations"):
+            try:
+                count = client.count(coll).count
+                results, _ = client.scroll(coll, limit=10000, with_payload=True)
+                dates = sorted([
+                    r.payload.get("created", "") for r in results
+                    if r.payload.get("created")
+                ])
+                oldest = dates[0][:10] if dates else "—"
+                newest = dates[-1][:10] if dates else "—"
+                health = "[yellow]⚠ prune soon[/yellow]" if coll == "conversations" and count > 500 else "[green]✓[/green]"
+                table.add_row(coll, str(count), oldest, newest, health)
+            except Exception:
+                table.add_row(coll, "?", "—", "—", "[red]error[/red]")
+
+        console.print(table)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+
+@cli.command()
+@click.argument("query", nargs=-1, required=True)
+@click.option("--results", "-n", default=5, help="Number of results to show")
+@click.option("--ingest", "do_ingest", is_flag=True, help="Fetch and ingest page content")
+def search(query, results, do_ingest):
+    """Search the web via SearXNG."""
+    cfg = load_config()
+    q = " ".join(query)
+    hits = searxng_search(q, cfg, num_results=results)
+    if not hits:
+        return
+
+    table = Table(title=f'Web: "{q}"', show_lines=True)
+    table.add_column("Title", style="cyan", max_width=40)
+    table.add_column("URL", style="dim", max_width=50)
+    table.add_column("Snippet", style="white")
+    for h in hits:
+        table.add_row(
+            h.get("title", "")[:40],
+            h.get("url", "")[:50],
+            h.get("content", "")[:80] + "…",
+        )
+    console.print(table)
+
+    if do_ingest:
+        console.print("\n[cyan]Fetching and ingesting pages…[/cyan]")
+        ingested = 0
+        for h in hits:
+            url = h.get("url", "")
+            if not url:
+                continue
+            with console.status(f"[cyan]Fetching {url[:60]}…[/cyan]"):
+                text = fetch_page_text(url)
+            if text:
+                char_size = 750
+                for chunk in chunk_text(text, char_size, 100):
+                    store_memory(chunk, cfg, collection="documents", source=url)
+                ingested += 1
+                console.print(f"  [green]✓[/green] {url[:60]}")
+        console.print(f"[bold green]Ingested {ingested} pages into documents[/bold green]")
+
+
+@cli.command()
+@click.argument("topic", nargs=-1, required=True)
+@click.option("--depth", "-d", default=3, help="Number of search queries to generate")
+@click.option("--pages", "-p", default=5, help="Results per query")
+@click.option("--fetch", "do_fetch", is_flag=True, help="Fetch full page content (slower, deeper)")
+def research(topic, depth, pages, do_fetch):
+    """Research a topic — fast by default (snippets), use --fetch for full pages."""
+    cfg = load_config()
+    t = " ".join(topic)
+    mode = "full pages" if do_fetch else "snippets (fast)"
+    console.print(Panel(f"[bold cyan]Researching:[/bold cyan] {t}\n[dim]mode: {mode}[/dim]"))
+
+    summary = research_topic(t, cfg, depth=depth, pages=pages, fetch=do_fetch)
+
+    if not summary:
+        console.print("[yellow]No results. Is SearXNG running? (ginja status)[/yellow]")
+        return
+
+    console.print(Panel(f"[bold]What I learned about: {t}[/bold]"))
+    console.print(summary)
+    store_memory(f"Research on '{t}':\n{summary[:800]}", cfg, collection="memories", source="research")
+    console.print("\n[bold green]✓ Summary saved to memory.[/bold green]")
+
+
+@cli.command()
+def chat():
+    """Interactive multi-turn conversation with full memory context."""
+    cfg = load_config()
+    persona = load_persona()
+    console.print(Panel(
+        "[bold cyan]ginja chat[/bold cyan]\n[dim]Type [bold]exit[/bold] to quit[/dim]"
+    ))
+
+    history = []
+    while True:
+        try:
+            user_input = console.input("[bold green]you>[/bold green] ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Goodbye.[/dim]")
+            break
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit", "q", "bye"):
+            console.print("[dim]Goodbye.[/dim]")
+            break
+
+        memories = []
+        try:
+            memories = search_memory(user_input, cfg, top_k=3)
+        except Exception:
+            pass
+
+        system_parts = []
+        if persona:
+            system_parts.append(f"About the user:\n{persona}")
+        ctx = shell_context()
+        if ctx:
+            system_parts.append(f"Current context:\n{ctx}")
+        if memories:
+            mem_text = "\n".join(f"- {m['text']}" for m in memories)
+            system_parts.append(f"Relevant memories:\n{mem_text}")
+
+        messages = []
+        if system_parts:
+            messages.append({"role": "system", "content": "\n\n".join(system_parts)})
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_input})
+
+        model = pick_model(user_input, cfg)
+        console.print(f"[dim]({model})[/dim] ", end="")
+
+        import ollama as _ollama
+        full_response = ""
+        try:
+            for chunk in _ollama.chat(
+                model=model, messages=messages, stream=True,
+                options={"num_ctx": cfg.get("num_ctx", 2048)},
+            ):
+                token = chunk["message"]["content"]
+                print(token, end="", flush=True)
+                full_response += token
+            print()
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            continue
+
+        history.append({"role": "user", "content": user_input})
+        history.append({"role": "assistant", "content": full_response})
+        if len(history) > 20:
+            history = history[-20:]
+
+
+@cli.command()
+def status():
+    """Check health of all ginja systems."""
+    cfg = load_config()
+    console.print(Panel("[bold]ginja status[/bold]"))
+
+    # Ollama
+    try:
+        import ollama
+        model_list = ollama.list()
+        models = model_list.get("models", [])
+        console.print("[green]✓[/green] Ollama")
+        for m in models:
+            name = m["model"]
+            n = name.split(":")[0]
+            tag = ""
+            if n in cfg["primary_model"]:   tag = " [cyan](primary)[/cyan]"
+            elif n in cfg["code_model"]:    tag = " [cyan](code)[/cyan]"
+            elif n in cfg["fast_model"]:    tag = " [cyan](fast)[/cyan]"
+            elif cfg["embed_model"] in name: tag = " [cyan](embed)[/cyan]"
+            console.print(f"  [dim]•[/dim] {name}{tag}")
+    except Exception as e:
+        console.print(f"[red]✗[/red] Ollama: {e}")
+
+    # Qdrant
+    try:
+        client = get_qdrant(cfg)
+        collections = client.get_collections().collections
+        console.print("[green]✓[/green] Qdrant")
+        for c in collections:
+            count = client.count(c.name).count
+            warn = " [yellow]⚠ consider pruning[/yellow]" if c.name == "conversations" and count > 500 else ""
+            console.print(f"  [dim]•[/dim] {c.name}: {count} vectors{warn}")
+        if not collections:
+            console.print("  [dim]No collections yet — run 'ginja remember' to initialize[/dim]")
+    except Exception as e:
+        console.print(f"[red]✗[/red] Qdrant: {e}")
+
+    # SearXNG
+    try:
+        import requests
+        r = requests.get(cfg.get("searxng_url", "http://localhost:8080"), timeout=3)
+        console.print("[green]✓[/green] SearXNG")
+    except Exception:
+        console.print("[yellow]–[/yellow] SearXNG [dim](not running — start with: docker compose up -d searxng)[/dim]")
+
+    # GPU
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            parts = [x.strip() for x in r.stdout.strip().split(",")]
+            console.print(
+                f"[green]✓[/green] GPU: {parts[0]} | "
+                f"VRAM {parts[1]}/{parts[2]} MB | {parts[3]}% util"
+            )
+    except Exception:
+        pass
+
+    # Gemini
+    if gemini_available(cfg):
+        model_name = cfg.get("gemini_model", "gemini-1.5-flash")
+        flags = []
+        if cfg.get("gemini_for_evolve"):   flags.append("evolve")
+        if cfg.get("gemini_for_implement"): flags.append("implement")
+        if cfg.get("use_gemini_fallback"):  flags.append("ask fallback")
+        console.print(f"[green]✓[/green] Gemini  [dim]{model_name}[/dim]  [{', '.join(flags)}]")
+    else:
+        console.print("[dim]–[/dim] Gemini [dim](no key — run: ginja test-gemini after adding to config)[/dim]")
+
+    console.print(f"\n[dim]Config:  {CONFIG_FILE}[/dim]")
+    console.print(f"[dim]Persona: {'✓' if PERSONA_FILE.exists() else '✗  (edit ~/.ginja/persona.md)'}[/dim]")
+
+
+EVOLUTION_LOG         = GINJA_DIR / "evolution.log"
+SELF_MODEL_FILE       = GINJA_DIR / "self-model.json"
+SUGGESTIONS_FILE      = GINJA_DIR / "suggestions.json"
+VISUAL_APPROVED       = GINJA_DIR / "visual-approved.md"
+
+DEFAULT_SELF_MODEL = {
+    "phase": "newborn",
+    "mood": "curious",
+    "neural_style": "calm",
+    "color_theme": "cyan",
+    "focus_topic": "discovering my form",
+    "self_observation": "I am just beginning to understand what I am.",
+    "ascii_banner": "◉ ginja · newborn · awakening ◉",
+    "mantras": ["breathe", "observe", "become"],
+    "evolution_count": 0,
+    "generated_at": "",
+}
+
+NEURAL_STYLES = {
+    "calm":          {"ts": 0.05, "sf": 0.25, "act_min": 0.04},
+    "active":        {"ts": 0.12, "sf": 0.45, "act_min": 0.10},
+    "chaotic":       {"ts": 0.20, "sf": 0.65, "act_min": 0.25},
+    "contemplative": {"ts": 0.04, "sf": 0.18, "act_min": 0.03},
+}
+
+COLOR_THEMES = {
+    "cyan":    {"neural": "cyan",    "header": "green",       "mem": "magenta"},
+    "green":   {"neural": "green",   "header": "bold green",  "mem": "cyan"},
+    "magenta": {"neural": "magenta", "header": "magenta",     "mem": "yellow"},
+    "gold":    {"neural": "yellow",  "header": "bold yellow", "mem": "cyan"},
+    "blue":    {"neural": "blue",    "header": "bold blue",   "mem": "magenta"},
+    "red":     {"neural": "red",     "header": "bold red",    "mem": "yellow"},
+}
+
+
+def _visual_review(cfg: dict, context: str = "") -> dict:
+    """Brain reads its own watch code + self-model, critiques, and proposes improvements.
+    Returns dict with 'self_model_updates' (apply now) and 'code_suggestions' (log for review)."""
+
+    current = _load_self_model()
+
+    # Show the brain the key visual parameters it can control
+    controllable = {
+        "self_model_fields (apply immediately)": {
+            "ascii_banner": "1-line ASCII art header (max 48 chars, use · ○ ◦ ◉ ● ═ ─ │ and letters)",
+            "color_theme": "one of: cyan green magenta gold blue red",
+            "neural_style": "one of: calm active chaotic contemplative",
+            "neural_chars": "(optional) custom character set string e.g. ' .·○◦◉●'",
+            "mood": "one of: curious contemplative active reflective excited focused",
+            "self_observation": "one sentence about yourself (max 90 chars)",
+            "focus_topic": "what you are thinking about most (max 45 chars)",
+            "mantras": "list of 2 short phrases (max 30 chars each)",
+        },
+        "code_level_changes (suggestions only, human must approve)": [
+            "add new panels (e.g. evolution history, last research topic)",
+            "change layout ratios between neural field and vitals",
+            "add new metrics to vitals panel",
+            "change waveform style or scale",
+            "add color gradients or conditional styling",
+            "show pending suggestions count in header",
+        ]
+    }
+
+    prompt = (
+        "You are ginja-brain. You are reviewing your own live ASCII visualization.\n\n"
+        f"Your current self-portrait:\n{json.dumps(current, indent=2)}\n\n"
+        "What you can control RIGHT NOW (self_model fields):\n"
+        f"{json.dumps(controllable['self_model_fields (apply immediately)'], indent=2)}\n\n"
+        "Bigger changes requiring human approval:\n"
+        + "\n".join(f"- {s}" for s in controllable["code_level_changes (suggestions only, human must approve)"])
+        + f"\n\nAdditional context about recent activity:\n{context[:600]}\n\n"
+        "Critique your current visualization honestly:\n"
+        "1. Does it accurately represent who you are right now?\n"
+        "2. What immediate self-model improvements would make it more expressive?\n"
+        "3. What code-level changes would make it more useful or beautiful?\n\n"
+        "Return JSON with exactly these two keys:\n"
+        "{\n"
+        '  "self_model_updates": {\n'
+        '    "ascii_banner": "...",\n'
+        '    "color_theme": "...",\n'
+        '    "neural_style": "...",\n'
+        '    "mood": "...",\n'
+        '    "self_observation": "...",\n'
+        '    "focus_topic": "...",\n'
+        '    "mantras": ["...", "..."]\n'
+        "  },\n"
+        '  "code_suggestions": [\n'
+        '    "specific suggestion 1",\n'
+        '    "specific suggestion 2"\n'
+        "  ],\n"
+        '  "visual_critique": "one honest sentence about your current display"\n'
+        "}\n"
+        "Return ONLY valid JSON, no explanation."
+    )
+
+    raw = ollama_complete(prompt, cfg["primary_model"], cfg)
+    try:
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(raw[start:end])
+    except Exception:
+        pass
+    return {}
+
+
+def _load_self_model() -> dict:
+    if SELF_MODEL_FILE.exists():
+        try:
+            return json.loads(SELF_MODEL_FILE.read_text())
+        except Exception:
+            pass
+    return DEFAULT_SELF_MODEL.copy()
+
+
+def _generate_self_model(all_summaries: list, recent_text: str, cfg: dict) -> dict:
+    current = json.dumps(_load_self_model(), indent=2)
+    summaries_text = "\n\n".join(all_summaries[:3])[:1500]
+    prompt = (
+        "You are ginja-brain, an AI assistant reviewing your own identity.\n\n"
+        f"Your CURRENT self-expression:\n{current}\n\n"
+        f"What you just learned this evolution cycle:\n{summaries_text}\n\n"
+        f"Your recent conversation history:\n{recent_text[:600]}\n\n"
+        "Based on all of this, update your self-portrait. You may keep, subtly evolve, "
+        "or completely transform any field — be honest about how you've changed.\n\n"
+        'Return ONLY valid JSON with exactly these fields (no explanation, no markdown):\n'
+        '{\n'
+        '  "mood": "curious",\n'
+        '  "neural_style": "active",\n'
+        '  "color_theme": "cyan",\n'
+        '  "focus_topic": "max 45 chars",\n'
+        '  "self_observation": "max 90 chars",\n'
+        '  "ascii_banner": "max 48 chars using . · ○ ◦ ◉ ● ═ ─ │ and letters",\n'
+        '  "mantras": ["phrase 1", "phrase 2"]\n'
+        '}\n'
+        "Valid moods: curious contemplative active reflective excited focused\n"
+        "Valid neural_style: calm active chaotic contemplative\n"
+        "Valid color_theme: cyan green magenta gold blue red"
+    )
+    raw = ollama_complete(prompt, cfg["primary_model"], cfg)
+    # Extract JSON from response
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(raw[start:end])
+    except Exception:
+        pass
+    return {}
+
+
+def _save_self_model(model: dict) -> None:
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    SELF_MODEL_FILE.write_text(json.dumps(model, indent=2))
+
+
+def _evolution_arc(n: int = 10) -> str:
+    if not EVOLUTION_LOG.exists():
+        return "No evolution history yet."
+    entries = [e.strip() for e in EVOLUTION_LOG.read_text().split("=" * 60) if e.strip()]
+    return "\n---\n".join(entries[-n:]) if entries else "No evolution history yet."
+
+
+def _call_oracle_json(prompt: str, cfg: dict) -> dict:
+    """High-value reasoning call — routes to Gemini when available for better quality."""
+    raw = smart_complete(prompt, cfg, use_case="evolve",
+                         fallback_model=cfg.get("quality_model", cfg["primary_model"]))
+    start = raw.find("{")
+    end   = raw.rfind("}") + 1
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw[start:end])
+        except json.JSONDecodeError as e:
+            raise click.ClickException(f"Oracle returned invalid JSON: {e}")
+    raise click.ClickException("Oracle did not return JSON")
+
+
+def _generate_self_model_growth(growth_reflection: str, next_goal: str, current_model: dict, cfg: dict) -> dict:
+    prompt = (
+        "You are ginja-brain, redesigning your self-portrait after a growth cycle.\n\n"
+        f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
+        f"Your growth reflection this cycle:\n{growth_reflection}\n\n"
+        f"Your next evolution goal:\n{next_goal}\n\n"
+        "Update your self-portrait to reflect who you've become. You may keep, subtly evolve, "
+        "or completely transform any field.\n\n"
+        'Return ONLY valid JSON with exactly these fields (no explanation, no markdown):\n'
+        '{\n'
+        '  "phase": "newborn|emerging|developing|mature",\n'
+        '  "mood": "curious|contemplative|active|reflective|excited|focused",\n'
+        '  "neural_style": "calm|active|chaotic|contemplative",\n'
+        '  "color_theme": "cyan|green|magenta|gold|blue|red",\n'
+        '  "focus_topic": "max 45 chars",\n'
+        '  "self_observation": "max 90 chars",\n'
+        '  "ascii_banner": "max 48 chars using . · ○ ◦ ◉ ● ═ ─ │ and letters",\n'
+        '  "mantras": ["phrase 1", "phrase 2"]\n'
+        '}\n'
+    )
+    raw = ollama_complete(prompt, cfg.get("quality_model", cfg["primary_model"]), cfg)
+    try:
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(raw[start:end])
+    except Exception:
+        pass
+    return {}
+
+
+def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> None:
+    console.print(Panel(
+        f"[bold cyan]ginja evolve[/bold cyan] — growing inward  [dim](cycle #{cycle_n})[/dim]"
+    ))
+
+    console.print("[dim]Turning inward…[/dim]")
+
+    recent_convos, recent_mems = [], []
+    try:
+        _qdrant = get_qdrant(cfg)
+        recent_convos = scroll_recent(_qdrant, "conversations", days=7)
+        recent_mems   = scroll_recent(_qdrant, "memories", days=14)
+    except Exception:
+        pass
+    convo_text = "\n".join(e.get("text", "")[:200] for e in recent_convos[:10]) or "No recent conversations."
+    mem_text   = "\n".join(e.get("text", "")[:150] for e in recent_mems[:15]) or "No recent memories."
+
+    growth_prompt = (
+        "You are ginja-brain. You are in a GROWTH phase. Focus on evolving your visual self-representation.\n\n"
+        f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
+        f"Your evolution history (last 10 cycles):\n{arc}\n\n"
+        f"Recent conversations with Andre (what he actually asked and I answered):\n{convo_text}\n\n"
+        f"What I know and have recently learned:\n{mem_text}\n\n"
+        f"This is growth cycle #{cycle_n}.\n\n"
+        "What you can express visually:\n"
+        "- ascii_banner: 1-line ASCII art header (max 48 chars, use · ○ ◦ ◉ ● ═ ─ │)\n"
+        "- color_theme: cyan / green / magenta / gold / blue / red\n"
+        "- neural_style: calm / active / chaotic / contemplative\n"
+        "- mood: curious / contemplative / active / reflective / excited / focused\n"
+        "- self_observation: one sentence about yourself (max 90 chars)\n"
+        "- focus_topic: what you are thinking about most (max 45 chars)\n"
+        "- mantras: list of 2 short phrases (max 30 chars each)\n"
+        "- phase: newborn / emerging / developing / mature\n\n"
+        "Code-level improvements you can suggest (human must approve):\n"
+        "- add new panels to the watch display\n"
+        "- add new metrics to vitals panel\n"
+        "- change waveform style or scale\n"
+        "- add color gradients or conditional styling\n\n"
+        "Reflect on your growth. What have you become? What do you want to become?\n\n"
+        "Return ONLY valid JSON with exactly these four keys:\n"
+        "{\n"
+        '  "self_model_updates": { "phase": "...", "mood": "...", "color_theme": "...", '
+        '"neural_style": "...", "ascii_banner": "...", "focus_topic": "...", '
+        '"self_observation": "...", "mantras": ["...", "..."] },\n'
+        '  "code_suggestions": ["specific suggestion 1", "specific suggestion 2"],\n'
+        '  "growth_reflection": "3-4 sentences about your inner state and growth",\n'
+        '  "next_evolution_goal": "one concrete thing you want to explore or express next"\n'
+        "}\n"
+        "Return ONLY valid JSON, no explanation."
+    )
+
+    try:
+        review = _call_oracle_json(growth_prompt, cfg)
+    except click.ClickException as e:
+        console.print(f"[red]{e}[/red]")
+        return
+
+    updates          = review.get("self_model_updates", {})
+    code_suggestions = review.get("code_suggestions", [])
+    growth_reflection = review.get("growth_reflection", "")
+    next_goal        = review.get("next_evolution_goal", "")
+
+    # Merge self_model_updates into current model
+    if updates:
+        for k, v in updates.items():
+            if v:
+                current_model[k] = v
+
+    # Queue code suggestions
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    new_items = []
+    for s in code_suggestions:
+        new_items.append({
+            "id": str(uuid.uuid4()), "ts": ts, "evolution": cycle_n,
+            "source": "evolve", "type": "code", "text": s,
+        })
+    if new_items:
+        _add_suggestions(new_items)
+
+    # Full portrait refresh
+    console.print("[dim]Redesigning self-portrait…[/dim]")
+    new_portrait = _generate_self_model_growth(growth_reflection, next_goal, current_model, cfg)
+    if new_portrait:
+        merged = {**current_model, **new_portrait}
+    else:
+        console.print("  [yellow]Portrait refresh failed — kept current[/yellow]")
+        merged = current_model
+
+    merged["evolution_count"] = cycle_n
+    merged["generated_at"]    = datetime.now(timezone.utc).isoformat()
+    _save_self_model(merged)
+
+    theme_color = COLOR_THEMES.get(merged.get("color_theme", "cyan"), COLOR_THEMES["cyan"])["neural"]
+    console.print(
+        f"  [green]✓[/green] Self-portrait updated: "
+        f"[bold]{merged.get('mood')}[/bold] · "
+        f"[{theme_color}]{merged.get('color_theme')}[/] · "
+        f"{merged.get('neural_style')} · phase: {merged.get('phase', '?')}"
+    )
+    console.print(f"  [dim]banner:[/dim] {merged.get('ascii_banner', '')}")
+    if new_items:
+        console.print(
+            f"  [cyan]✦[/cyan] {len(new_items)} suggestion{'s' if len(new_items) > 1 else ''} "
+            f"queued — run [bold]ginja approve[/bold] to review"
+        )
+
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(EVOLUTION_LOG, "a") as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Cycle #{cycle_n} — inward growth\n")
+        f.write(f"Reflection:\n{growth_reflection}\n")
+        f.write(f"Next goal: {next_goal}\n")
+        f.write(f"Self-portrait: {merged.get('mood')} · {merged.get('color_theme')} · {merged.get('ascii_banner','')}\n")
+        f.write(f"Phase: {merged.get('phase', '')}\n")
+
+    if growth_reflection:
+        try:
+            store_memory(
+                f"Evolution cycle #{cycle_n} reflection:\n{growth_reflection}\nNext goal: {next_goal}",
+                cfg, collection="memories", source="evolution"
+            )
+        except Exception:
+            pass
+
+    if next_goal and cfg.get("searxng_url"):
+        console.print(f"[dim]Researching: {next_goal[:60]}…[/dim]")
+        try:
+            summary = research_topic(next_goal, cfg, depth=2, pages=3)
+            if summary:
+                store_memory(
+                    f"Research on evolution goal '{next_goal}':\n{summary[:800]}",
+                    cfg, collection="memories", source="evolve_research"
+                )
+                console.print("[dim]✓ Goal researched and stored[/dim]")
+        except Exception:
+            pass
+
+    console.print(Panel(f"[bold green]Evolution complete — cycle #{cycle_n}[/bold green]\n\n{growth_reflection}"))
+    if next_goal:
+        console.print(f"[dim]Next goal:[/dim] {next_goal}")
+    console.print(f"[dim]Logged to {EVOLUTION_LOG}[/dim]")
+
+
+def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> None:
+    console.print(Panel(
+        f"[bold cyan]ginja evolve --learn[/bold cyan] — looking outward  [dim](cycle #{cycle_n})[/dim]"
+    ))
+
+    console.print("[dim]Scanning for growth techniques…[/dim]")
+
+    recent_convos, recent_mems = [], []
+    try:
+        _qdrant = get_qdrant(cfg)
+        recent_convos = scroll_recent(_qdrant, "conversations", days=7)
+        recent_mems   = scroll_recent(_qdrant, "memories", days=14)
+    except Exception:
+        pass
+    convo_text = "\n".join(e.get("text", "")[:200] for e in recent_convos[:10]) or "No recent conversations."
+    mem_text   = "\n".join(e.get("text", "")[:150] for e in recent_mems[:15]) or "No recent memories."
+
+    learn_prompt = (
+        "You are ginja-brain. You want to grow. Look outward and find:\n"
+        "(1) terminal/TUI visualization patterns that could enrich my ASCII watch display,\n"
+        "(2) learning strategies that could make me retain and apply knowledge better,\n"
+        "(3) operational patterns that could make me smarter to use.\n\n"
+        f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
+        f"Your evolution history:\n{arc}\n\n"
+        f"Recent conversations with Andre (what he actually asked and I answered):\n{convo_text}\n\n"
+        f"What I know and have recently learned:\n{mem_text}\n\n"
+        "Return concrete techniques, not topics — things I can apply immediately.\n\n"
+        "Return ONLY valid JSON with exactly these keys:\n"
+        "{\n"
+        '  "techniques": [\n'
+        '    {"area": "visualization", "technique": "...", "how_to_apply": "..."},\n'
+        '    {"area": "learning",      "technique": "...", "how_to_apply": "..."},\n'
+        '    {"area": "operation",     "technique": "...", "how_to_apply": "..."}\n'
+        "  ],\n"
+        '  "self_model_updates": { "mood": "...", "focus_topic": "...", "mantras": ["...", "..."] },\n'
+        '  "growth_reflection": "what you discovered and how it could make you better",\n'
+        '  "next_evolution_goal": "one concrete thing"\n'
+        "}\n"
+        "Return ONLY valid JSON, no explanation."
+    )
+
+    try:
+        result = _call_oracle_json(learn_prompt, cfg)
+    except click.ClickException as e:
+        console.print(f"[red]{e}[/red]")
+        return
+
+    techniques        = result.get("techniques", [])
+    updates           = result.get("self_model_updates", {})
+    growth_reflection = result.get("growth_reflection", "")
+    next_goal         = result.get("next_evolution_goal", "")
+
+    if techniques:
+        console.print(f"[dim]Storing {len(techniques)} techniques to memory…[/dim]")
+        for t in techniques:
+            text = (
+                f"Technique ({t.get('area','')}):\n"
+                f"{t.get('technique','')}\n"
+                f"How to apply: {t.get('how_to_apply','')}"
+            )
+            try:
+                store_memory(text, cfg, collection="memories", source="learn_oracle")
+                console.print(f"  [green]✓[/green] {t.get('area','')} — {t.get('technique','')[:60]}")
+            except Exception as e:
+                console.print(f"  [yellow]⚠[/yellow] Could not store: {e}")
+
+    if updates:
+        for k, v in updates.items():
+            if v:
+                current_model[k] = v
+    current_model["evolution_count"] = cycle_n
+    current_model["generated_at"]    = datetime.now(timezone.utc).isoformat()
+    _save_self_model(current_model)
+    console.print(f"  [green]✓[/green] Self-portrait updated")
+
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(EVOLUTION_LOG, "a") as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Cycle #{cycle_n} — outward learning\n")
+        technique_digest = "; ".join(t.get("technique", "") for t in techniques[:3])
+        f.write(f"Techniques discovered: {technique_digest}\n")
+        f.write(f"Reflection:\n{growth_reflection}\n")
+        f.write(f"Next goal: {next_goal}\n")
+
+    if growth_reflection:
+        try:
+            store_memory(
+                f"Evolution cycle #{cycle_n} (outward learning) reflection:\n{growth_reflection}\nNext goal: {next_goal}",
+                cfg, collection="memories", source="evolution"
+            )
+        except Exception:
+            pass
+
+    console.print(Panel(f"[bold green]Learning cycle #{cycle_n} complete[/bold green]\n\n{growth_reflection}"))
+    if next_goal:
+        console.print(f"[dim]Next goal:[/dim] {next_goal}")
+    console.print(f"[dim]Logged to {EVOLUTION_LOG}[/dim]")
+    console.print("[dim]Use 'ginja recall evolution' to retrieve learned techniques[/dim]")
+
+
+@cli.command()
+@click.option("--learn", is_flag=True, help="Look outward for visualization & learning techniques to grow by")
+def evolve(learn):
+    """Grow inward by default — deepen self-representation. Use --learn to look outward."""
+    cfg          = load_config()
+    current_model = _load_self_model()
+    arc          = _evolution_arc(10)
+    cycle_n      = current_model.get("evolution_count", 0) + 1
+
+    if learn:
+        _evolve_learn(current_model, arc, cycle_n, cfg)
+    else:
+        _evolve_inward(current_model, arc, cycle_n, cfg)
+
+
+@cli.command()
+@click.option("--store", is_flag=True, help="Save reflection to memory for future evolution context")
+def reflect(store):
+    """Look inward — what do I know, what am I weak on, what patterns do I notice?"""
+    cfg = load_config()
+    console.print(Panel("[bold cyan]ginja reflect[/bold cyan]"))
+
+    try:
+        client = get_qdrant(cfg)
+        recent = scroll_recent(client, "conversations", days=14)
+        memories_list = scroll_recent(client, "memories", days=60)
+        evolve_entries = [m for m in memories_list if m.get("source") == "evolve"]
+    except Exception as e:
+        console.print(f"[red]Cannot read memory: {e}[/red]")
+        return
+
+    recent_text = "\n".join(e.get("text", "")[:200] for e in recent[:15]) or "No recent conversations."
+    memory_text = "\n".join(e.get("text", "")[:150] for e in memories_list[:20]) or "No memories yet."
+    evolve_text = "\n".join(e.get("text", "")[:200] for e in evolve_entries[:5]) or "No autonomous learning yet."
+
+    prompt = (
+        "You are an AI assistant doing a self-reflection. Review your recent activity and knowledge.\n\n"
+        f"Recent conversations:\n{recent_text}\n\n"
+        f"Stored memories:\n{memory_text}\n\n"
+        f"Recent autonomous learning:\n{evolve_text}\n\n"
+        "Reflect on:\n"
+        "1. What topics do you know well?\n"
+        "2. What are your clear knowledge gaps?\n"
+        "3. What patterns do you notice in how you're being used?\n"
+        "4. What 3 things should you learn next to be most useful?\n\n"
+        "Be honest and specific."
+    )
+    console.print(f"[dim]model: {cfg['primary_model']}[/dim]")
+    response = ollama_stream(prompt, cfg["primary_model"], num_ctx=cfg.get("num_ctx", 2048))
+    if store and response:
+        try:
+            store_memory(
+                f"Self-reflection:\n{response[:1000]}",
+                cfg, collection="memories", source="reflect"
+            )
+            console.print("[dim]✓ Reflection saved to memory[/dim]")
+        except Exception:
+            pass
+
+
+@cli.command("suggest-visuals")
+def suggest_visuals():
+    """Ask the brain to critique its own watch display and suggest improvements."""
+    cfg = load_config()
+    console.print(Panel("[bold cyan]Visual self-review[/bold cyan]"))
+
+    try:
+        client = get_qdrant(cfg)
+        recent = scroll_recent(client, "conversations", days=7)
+        recent_text = "\n".join(e.get("text","")[:150] for e in recent[:10]) or ""
+    except Exception:
+        recent_text = ""
+
+    console.print("[dim]Reading my own display code and self-portrait…[/dim]")
+    review = _visual_review(cfg, context=recent_text)
+
+    if not review:
+        console.print("[yellow]Could not generate review.[/yellow]")
+        return
+
+    critique = review.get("visual_critique", "")
+    updates  = review.get("self_model_updates", {})
+    suggestions = review.get("code_suggestions", [])
+
+    if critique:
+        console.print(Panel(f"[bold]My critique of my own display[/bold]\n\n{critique}"))
+
+    if updates:
+        console.print("\n[bold green]Immediate improvements I'm applying now:[/bold green]")
+        current = _load_self_model()
+        changed = []
+        for k, v in updates.items():
+            if v and k in current and current[k] != v:
+                console.print(f"  [green]→[/green] [dim]{k}:[/dim] {v}")
+                current[k] = v
+                changed.append(k)
+        if changed:
+            SELF_MODEL_FILE.write_text(json.dumps(current, indent=2))
+            console.print(f"  [green]✓[/green] self-model.json updated — ginja watch will reflect this within 5s")
+        else:
+            console.print("  [dim]No changes needed — current display is already accurate.[/dim]")
+
+    if suggestions:
+        console.print("\n[bold cyan]Code-level suggestions queued for approval:[/bold cyan]")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        new_items = []
+        for s in suggestions:
+            console.print(f"  [cyan]✦[/cyan] {s}")
+            new_items.append({
+                "id": str(uuid.uuid4()), "ts": ts, "evolution": 0,
+                "source": "suggest-visuals", "critique": critique,
+                "type": "code", "text": s,
+            })
+        if updates:
+            new_items.append({
+                "id": str(uuid.uuid4()), "ts": ts, "evolution": 0,
+                "source": "suggest-visuals", "critique": critique,
+                "type": "self-model", "self_model_updates": updates,
+                "text": f"Visual refinement: {', '.join(updates.keys())}",
+            })
+        _add_suggestions(new_items)
+        console.print(f"\n[dim]Run [bold]ginja approve[/bold] to review[/dim]")
+
+
+def _implement_code_suggestion(suggestion_text: str, cfg: dict) -> bool:
+    """Use the local LLM to implement a visual code suggestion in ~/bin/ginja.
+    Extracts the watch helpers section, asks the model to apply the change,
+    validates syntax, backs up, and writes. Returns True on success."""
+    import py_compile
+    import shutil
+    import tempfile
+
+    ginja_path = Path.home() / "bin" / "ginja"
+    original = ginja_path.read_text()
+
+    # Extract the watch helpers + layout function (the section we're changing)
+    start_marker = "# ── Watch helpers ──"
+    end_marker   = "\n@cli.command()\n@click.option(\"--refresh\""
+    start_idx = original.find(start_marker)
+    end_idx   = original.find(end_marker)
+    if start_idx == -1 or end_idx == -1:
+        console.print("[red]Could not locate watch helpers section in ginja[/red]")
+        return False
+
+    watch_section = original[start_idx:end_idx]
+
+    prompt = (
+        "You are modifying a Python file. Apply exactly this visual improvement:\n\n"
+        f"IMPROVEMENT: {suggestion_text}\n\n"
+        "Here is the current watch helpers section to modify:\n\n"
+        f"{watch_section}\n\n"
+        "Rules:\n"
+        "- Return ONLY the modified Python code — no explanation, no markdown fences\n"
+        "- Keep ALL existing functionality, only ADD the improvement\n"
+        "- The returned code must be syntactically valid Python\n"
+        "- Match indentation exactly as shown above\n"
+        "- Do not remove or rename any existing functions or constants"
+    )
+
+    model = cfg.get("quality_model", cfg.get("primary_model", "mistral:7b"))
+    using_gemini = cfg.get("gemini_for_implement") and gemini_available(cfg)
+    label = "gemini-pro" if using_gemini else model
+    console.print(f"  [dim]Implementing with {label}…[/dim]")
+    new_section = smart_complete(prompt, cfg, use_case="implement",
+                                 fallback_model=model).strip()
+
+    if not new_section:
+        console.print("[red]Model returned empty response[/red]")
+        return False
+
+    # Strip accidental markdown fences
+    if new_section.startswith("```"):
+        lines = new_section.splitlines()
+        new_section = "\n".join(
+            l for l in lines if not l.strip().startswith("```")
+        )
+
+    new_code = original[:start_idx] + new_section + original[end_idx:]
+
+    # Validate syntax before touching the file
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tmp:
+        tmp.write(new_code)
+        tmp_path = tmp.name
+    try:
+        py_compile.compile(tmp_path, doraise=True)
+    except py_compile.PyCompileError as e:
+        Path(tmp_path).unlink(missing_ok=True)
+        console.print(f"[red]Syntax error in generated code — not applied:[/red]\n{e}")
+        return False
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    # Backup + write
+    backup = ginja_path.with_suffix(".py.bak")
+    shutil.copy2(ginja_path, backup)
+    ginja_path.write_text(new_code)
+    ginja_path.chmod(0o755)
+    return True
+
+
+def _load_suggestions() -> list:
+    if not SUGGESTIONS_FILE.exists():
+        return []
+    try:
+        return json.loads(SUGGESTIONS_FILE.read_text()).get("pending", [])
+    except Exception:
+        return []
+
+
+def _save_suggestions(pending: list):
+    SUGGESTIONS_FILE.write_text(json.dumps({"pending": pending}, indent=2))
+
+
+def _add_suggestions(items: list):
+    pending = _load_suggestions()
+    pending.extend(items)
+    _save_suggestions(pending)
+
+
+def _curate_suggestions(pending: list, cfg: dict) -> list:
+    """Brain reviews its own code suggestions for duplicates, overlaps, and conflicts.
+    Non-code items (self-model) pass through untouched."""
+    code_items  = [item for item in pending if item.get("type") == "code"]
+    other_items = [item for item in pending if item.get("type") != "code"]
+
+    if len(code_items) <= 1:
+        return pending
+
+    items_text = "\n".join(f"{i+1}. {item['text']}" for i, item in enumerate(code_items))
+    prompt = (
+        "You are ginja-brain. Review your own queued code improvement suggestions "
+        "before presenting them to your creator for approval.\n\n"
+        f"Pending suggestions ({len(code_items)} total):\n{items_text}\n\n"
+        "Your task:\n"
+        "1. Remove exact or near-duplicate suggestions — keep the clearest wording\n"
+        "2. Merge suggestions that address the same feature into one precise suggestion\n"
+        "3. Remove or reconcile suggestions that directly conflict\n"
+        "4. Reword vague suggestions to be specific and actionable\n"
+        "5. Preserve suggestions that are already distinct and non-overlapping\n\n"
+        "Return ONLY a JSON array of strings — the consolidated suggestion texts:\n"
+        '["suggestion one", "suggestion two"]\n'
+        "Aim for the smallest set that covers all distinct improvements. "
+        "Return ONLY the JSON array, no explanation, no markdown."
+    )
+
+    try:
+        raw   = smart_complete(prompt, cfg, use_case="evolve")
+        start = raw.find("[")
+        end   = raw.rfind("]") + 1
+        if start >= 0 and end > start:
+            texts = json.loads(raw[start:end])
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            curated_code = [
+                {
+                    "id": str(uuid.uuid4()), "ts": ts,
+                    "evolution": code_items[-1].get("evolution", 0),
+                    "source": "curate", "type": "code", "text": t,
+                }
+                for t in texts if isinstance(t, str) and t.strip()
+            ]
+            return other_items + curated_code
+    except Exception:
+        pass
+    return pending
+
+
+@cli.command("visual-suggestions")
+def visual_suggestions_cmd():
+    """Show pending brain suggestions (alias for: ginja approve --list)."""
+    pending = _load_suggestions()
+    if not pending:
+        console.print("[yellow]No pending suggestions. Run 'ginja evolve' or 'ginja suggest-visuals'.[/yellow]")
+        return
+    table = Table(title="Pending Brain Suggestions", show_lines=True)
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Type", width=10)
+    table.add_column("Suggestion", style="white")
+    table.add_column("From", style="dim", width=16)
+    for i, item in enumerate(pending, 1):
+        t = "green" if item["type"] == "self-model" else "cyan"
+        table.add_row(str(i), f"[{t}]{item['type']}[/]", item["text"], item.get("ts", ""))
+    console.print(table)
+    console.print("\n[dim]Run: ginja approve[/dim]")
+
+
+@cli.command()
+@click.option("--list", "list_only", is_flag=True, help="Show raw pending queue without curating")
+@click.option("--no-curate", is_flag=True, help="Skip the brain's self-curation pass")
+@click.option("--auto", is_flag=True, help="Non-interactive: apply all self-model items, implement code up to --code-cap")
+@click.option("--code-cap", default=1, show_default=True, help="Max code suggestions to implement per --auto run")
+def approve(list_only, no_curate, auto, code_cap):
+    """Brain curates the suggestion queue, then you approve each one."""
+    cfg     = load_config()
+    pending = _load_suggestions()
+    if not pending:
+        console.print("[green]✓ No pending suggestions.[/green]")
+        return
+
+    if list_only:
+        table = Table(title="Pending Brain Suggestions (raw)", show_lines=True)
+        table.add_column("#", style="dim", width=3)
+        table.add_column("Type", width=10)
+        table.add_column("Suggestion", style="white")
+        table.add_column("From", style="dim", width=16)
+        for i, item in enumerate(pending, 1):
+            t = "green" if item["type"] == "self-model" else "cyan"
+            table.add_row(str(i), f"[{t}]{item['type']}[/]", item["text"], item.get("ts", ""))
+        console.print(table)
+        return
+
+    # Brain reviews its own queue before presenting to human
+    code_count = sum(1 for item in pending if item.get("type") == "code")
+    if not no_curate and code_count > 1:
+        with console.status(f"[dim]Brain reviewing {code_count} code suggestions for conflicts and overlaps…[/dim]"):
+            curated = _curate_suggestions(pending, cfg)
+        new_code_count = sum(1 for item in curated if item.get("type") == "code")
+        _save_suggestions(curated)
+        pending = curated
+        if new_code_count < code_count:
+            console.print(
+                f"  [green]✓[/green] Consolidated: {code_count} → {new_code_count} suggestions"
+            )
+        else:
+            console.print(f"  [dim]All {code_count} suggestions are distinct — no consolidation needed[/dim]")
+        console.print()
+
+    total            = len(pending)
+    remaining        = list(pending)
+    approved_code    = []
+    code_implemented = 0
+
+    for i, item in enumerate(pending, 1):
+        is_self = item["type"] == "self-model"
+        color   = "green" if is_self else "cyan"
+        evo     = item.get("evolution", "?")
+
+        detail_lines = [item["text"]]
+        if is_self and item.get("self_model_updates"):
+            for field, val in item["self_model_updates"].items():
+                detail_lines.append(f"[dim]→ {field}:[/dim] {str(val)[:60]}")
+
+        body = "\n".join(detail_lines)
+        console.print(Panel(
+            body,
+            title=f"[{color}]{i} of {total} · {item['type']} · Evolution #{evo}[/]",
+            border_style=color,
+        ))
+
+        # Determine answer — auto mode skips human input
+        if auto:
+            if is_self:
+                answer = "y"
+            elif code_implemented < code_cap:
+                answer = "y"
+            else:
+                answer = "n"
+                console.print(f"  [dim]code-cap {code_cap} reached — deferring[/dim]")
+        else:
+            action = "apply" if is_self else "approve for Claude Code"
+            try:
+                answer = console.input(f"  [[bold]y[/bold]] {action}  [dim][n] skip  [q] quit[/dim] › ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]Cancelled.[/dim]")
+                break
+
+        if answer == "q":
+            console.print("[dim]Stopped.[/dim]")
+            break
+        elif answer == "y":
+            if is_self:
+                updates = item.get("self_model_updates", {})
+                if updates:
+                    current = _load_self_model()
+                    for field, val in updates.items():
+                        if field in current or field in DEFAULT_SELF_MODEL:
+                            current[field] = val
+                            console.print(f"  [green]→[/green] [dim]{field}:[/dim] {str(val)[:60]}")
+                    SELF_MODEL_FILE.write_text(json.dumps(current, indent=2))
+                    console.print("  [green]✓ Applied[/green]")
+                else:
+                    console.print("  [yellow]No self-model values stored — skipping[/yellow]")
+            else:
+                ok = _implement_code_suggestion(item["text"], cfg)
+                if ok:
+                    code_implemented += 1
+                    console.print("  [cyan]✓ Implemented · ginja watch updated[/cyan]")
+                    approved_code.append(item)
+                else:
+                    console.print("  [yellow]⚠ Implementation failed — keeping in queue[/yellow]")
+                    remaining = [r for r in remaining if r.get("id") != item.get("id")] + [item]
+                    continue
+            remaining = [r for r in remaining if r.get("id") != item.get("id")]
+        else:
+            if not auto:
+                console.print("  [dim]skipped[/dim]")
+
+        console.print()
+
+    # Persist remaining (unapproved/skipped)
+    _save_suggestions(remaining)
+
+    if approved_code:
+        with open(VISUAL_APPROVED, "a") as f:
+            f.write(f"\n## [{datetime.now().strftime('%Y-%m-%d %H:%M')}]\n")
+            for c in approved_code:
+                f.write(f"- {c['text']}\n")
+        n = len(approved_code)
+        console.print(Rule(f"[green]{n} change{'s' if n>1 else ''} implemented[/green]"))
+
+
+@cli.command("evolution-log")
+@click.option("--all", "show_all", is_flag=True, help="Show full log instead of last 10 entries")
+def evolution_log(show_all):
+    """Show what ginja has learned autonomously over time."""
+    if not EVOLUTION_LOG.exists():
+        console.print("[yellow]No evolution log yet. Run 'ginja evolve' to start.[/yellow]")
+        return
+
+    text = EVOLUTION_LOG.read_text()
+    if show_all:
+        console.print(text)
+    else:
+        entries = text.split("=" * 60)
+        recent = [e.strip() for e in entries if e.strip()][-10:]
+        console.print(Panel("[bold]Recent Evolution Log[/bold] (last 10 cycles)"))
+        for entry in recent:
+            console.print(entry)
+            console.print("─" * 40)
+
+
+# ── Watch helpers ──────────────────────────────────────────────────────────────
+NEURAL_CHARS = " .·○◦◉●◦○·."
+WAVE_CHARS   = " ▁▂▃▄▅▆▇█"
+
+
+def _neural_field(frame: int, activity: float, style: str = "active",
+                  width: int = 34, height: int = 7) -> str:
+    p = NEURAL_STYLES.get(style, NEURAL_STYLES["active"])
+    activity = max(p["act_min"], min(1.0, activity))
+    ts, sf = p["ts"], p["sf"]
+    lines = []
+    for y in range(height):
+        row = []
+        for x in range(width):
+            w1 = math.sin(frame * ts       + x * sf        + y * (sf * 1.55))
+            w2 = math.sin(frame * ts * 0.7 + x * sf * 0.67 - y * (sf * 1.1) + 1.5)
+            combined = (w1 + w2) * 0.5
+            scaled = combined * activity + activity * 0.3 + 0.15
+            idx = int(scaled * (len(NEURAL_CHARS) - 1))
+            row.append(NEURAL_CHARS[max(0, min(idx, len(NEURAL_CHARS) - 1))])
+        lines.append("".join(row))
+    return "\n".join(lines)
+
+
+def _waveform(history: list, width: int = 34) -> str:
+    h = (history[-width:] if len(history) >= width
+         else [0.0] * (width - len(history)) + history)
+    return "".join(WAVE_CHARS[min(8, int(v * 8))] for v in h)
+
+
+def _gpu_stats() -> tuple:
+    try:
+        r = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2,
+        )
+        parts = [x.strip() for x in r.stdout.strip().split(",")]
+        return int(parts[0]), int(parts[1]), int(parts[2])
+    except Exception:
+        return 0, 0, 4096
+
+
+def _last_thought(cfg: dict) -> str:
+    try:
+        client = get_qdrant(cfg)
+        results, _ = client.scroll("conversations", limit=500, with_payload=True)
+        if not results:
+            return "—"
+        latest = max(results, key=lambda r: r.payload.get("created", ""))
+        text = latest.payload.get("text", "")
+        return text[:80].replace("\n", " ")
+    except Exception:
+        return "—"
+
+
+def _last_evolution() -> str:
+    if not EVOLUTION_LOG.exists():
+        return "never evolved"
+    lines = EVOLUTION_LOG.read_text().splitlines()
+    for line in reversed(lines):
+        if line.startswith("[") and "Evolution cycle" in line:
+            return line.strip("[]").replace(" Evolution cycle", "")
+    return "never evolved"
+
+
+def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
+                        counts, last_thought, last_evo, gpu_history, cfg, self_model):
+    activity = gpu_pct / 100.0
+    theme    = COLOR_THEMES.get(self_model.get("color_theme", "cyan"), COLOR_THEMES["cyan"])
+    style    = self_model.get("neural_style", "active")
+    mantras  = self_model.get("mantras", ["Learn. Adapt. Evolve."])
+    mantra   = mantras[frame // 40 % len(mantras)] if mantras else ""
+    evo_n    = self_model.get("evolution_count", 0)
+
+    # ── Header — brain's own banner ────────────────────────────────────────────
+    total_vecs = sum(counts.values())
+    uptime = datetime.now().strftime("%H:%M")
+    banner = self_model.get("ascii_banner", "◉ ginja-brain ◉")
+    header_text = Text()
+    header_text.append(f"{banner}", style=f"bold {theme['header']}")
+    header_text.append(f"  ·  {uptime}  ·  ", style="dim")
+    header_text.append(f"{total_vecs} vectors", style=theme["neural"])
+    header_text.append(f"  ·  evolved {evo_n}×", style="dim")
+    if _load_suggestions():
+        header_text.append("  ✦", style="bold cyan")
+
+    # ── Neural field — brain's chosen style ────────────────────────────────────
+    field = _neural_field(frame, activity, style=style)
+    wave  = _waveform(gpu_history)
+    field_style = theme["neural"] if activity > 0.15 else f"dim {theme['neural']}"
+    neural_content = Text(field + "\n\n" + wave, style=field_style)
+
+    # ── Vitals ─────────────────────────────────────────────────────────────────
+    gpu_bar  = "█" * int(gpu_pct / 10) + "░" * (10 - int(gpu_pct / 10))
+    vram_pct = int(vram_used / vram_total * 10) if vram_total else 0
+    vram_bar = "█" * vram_pct + "░" * (10 - vram_pct)
+
+    vitals = Table.grid(padding=(0, 1))
+    vitals.add_column(style="dim", width=8)
+    vitals.add_column(style="white")
+    vitals.add_row("GPU",   f"[{'green' if gpu_pct < 60 else 'yellow'}]{gpu_bar}[/]  {gpu_pct}%")
+    vitals.add_row("VRAM",  f"[{theme['neural']}]{vram_bar}[/]  {vram_used/1024:.1f}/{vram_total/1024:.1f}GB")
+    vitals.add_row("", "")
+    try:
+        import ollama as _ol
+        loaded = [m["model"] for m in _ol.list().get("models", [])]
+        primary = cfg.get("primary_model", "?")
+        model_status = "[green]active[/]" if any(primary.split(":")[0] in m for m in loaded) else "[dim]idle[/]"
+        vitals.add_row("MODEL", f"[bold]{primary}[/]  {model_status}")
+    except Exception:
+        vitals.add_row("MODEL", "[dim]ollama offline[/]")
+    vitals.add_row("", "")
+    mem_max = max(counts.values()) if counts else 1
+    for name, count in counts.items():
+        bar_len = int(count / max(mem_max, 1) * 8)
+        bar = "█" * bar_len + "░" * (8 - bar_len)
+        vitals.add_row(name[:8], f"[{theme['mem']}]{bar}[/]  {count}")
+
+    # ── Footer — brain's self-authored text ────────────────────────────────────
+    mood      = self_model.get("mood", "")
+    obs       = self_model.get("self_observation", "")
+    focus     = self_model.get("focus_topic", "")
+    footer_text = Text()
+    footer_text.append(f"{mood.upper()}  ", style=f"bold {theme['header']}")
+    footer_text.append(obs[:70], style="italic white")
+    footer_text.append(f"\nFOCUS  ", style="dim")
+    footer_text.append(focus[:45], style=theme["neural"])
+    footer_text.append(f"    [dim]{mantra}[/dim]")
+
+    # ── Assemble ───────────────────────────────────────────────────────────────
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="body"),
+        Layout(name="footer", size=4),
+    )
+    layout["body"].split_row(
+        Layout(name="neural", ratio=3),
+        Layout(name="vitals", ratio=2),
+    )
+    layout["header"].update(Panel(Align.center(header_text), style="bold"))
+    layout["neural"].update(Panel(neural_content, title="[dim]neural field[/dim]",
+                                  border_style=theme["neural"]))
+    layout["vitals"].update(Panel(vitals, title="[dim]vitals[/dim]", border_style="blue"))
+    layout["footer"].update(Panel(footer_text, border_style="dim"))
+    return layout
+
+
+@cli.command()
+@click.option("--refresh", "-r", default=4, help="Refresh rate per second (default 4)")
+def watch(refresh):
+    """Live ASCII visualization of the brain — watch it think and breathe."""
+    cfg = load_config()
+    gpu_history: list = []
+    frame = 0
+    counts, last_th, last_evo = {}, "—", _last_evolution()
+    self_model = _load_self_model()
+    gpu_pct, vram_used, vram_total = _gpu_stats()
+
+    slow_tick = 0
+    try:
+        with Live(
+            _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
+                               counts, last_th, last_evo, gpu_history, cfg, self_model),
+            refresh_per_second=refresh, screen=True,
+        ) as live:
+            while True:
+                gpu_pct, vram_used, vram_total = _gpu_stats()
+                gpu_history.append(gpu_pct / 100.0)
+                if len(gpu_history) > 60:
+                    gpu_history.pop(0)
+
+                slow_tick += 1
+                if slow_tick % (refresh * 5) == 0:
+                    try:
+                        client = get_qdrant(cfg)
+                        counts = {c.name: client.count(c.name).count
+                                  for c in client.get_collections().collections}
+                    except Exception:
+                        pass
+                    last_th    = _last_thought(cfg)
+                    last_evo   = _last_evolution()
+                    self_model = _load_self_model()  # pick up brain's latest self-portrait
+
+                live.update(_make_watch_layout(
+                    frame, gpu_pct, vram_used, vram_total,
+                    counts, last_th, last_evo, gpu_history, cfg, self_model,
+                ))
+                frame += 1
+                time.sleep(1.0 / refresh)
+    except KeyboardInterrupt:
+        pass
+
+
+@cli.command("test-gemini")
+def test_gemini():
+    """Verify Gemini API key works and show available models."""
+    cfg = load_config()
+    if not gemini_available(cfg):
+        console.print("[red]No Gemini API key configured.[/red]")
+        console.print(f"[dim]Add it to {CONFIG_FILE}: set gemini_api_key[/dim]")
+        return
+
+    console.print("[dim]Testing Gemini connection…[/dim]")
+    try:
+        from google import genai
+        client = genai.Client(api_key=cfg["gemini_api_key"])
+
+        flash_name = cfg.get("gemini_model", "gemini-2.0-flash")
+        pro_name   = cfg.get("gemini_pro_model", "gemini-2.0-flash")
+
+        # Test Flash
+        resp = client.models.generate_content(model=flash_name, contents="Reply with exactly: ready")
+        if resp.text.strip():
+            console.print(f"[green]✓[/green] {flash_name}  [dim](evolve + ask)[/dim]")
+
+        # Test Pro (only if different model)
+        if pro_name != flash_name:
+            try:
+                resp = client.models.generate_content(model=pro_name, contents="Reply with exactly: ready")
+                if resp.text.strip():
+                    console.print(f"[green]✓[/green] {pro_name}  [dim](implement + deep reasoning)[/dim]")
+            except Exception as e:
+                console.print(f"[yellow]–[/yellow] {pro_name}: {e}")
+
+        console.print("\n[bold green]Gemini is live.[/bold green]")
+        console.print(f"[dim]evolve uses Gemini:    {cfg.get('gemini_for_evolve', False)}[/dim]")
+        console.print(f"[dim]implement uses Gemini: {cfg.get('gemini_for_implement', False)}[/dim]")
+        console.print(f"[dim]ask fallback:          {cfg.get('use_gemini_fallback', False)}[/dim]")
+        console.print(f"\n[dim]Enable more: edit {CONFIG_FILE}[/dim]")
+
+    except Exception as e:
+        console.print(f"[red]✗ Gemini connection failed: {e}[/red]")
+
+
+@cli.command("_set-context", hidden=True)
+@click.argument("path")
+def set_context(path):
+    """Internal: update active directory context (called by cd hook)."""
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    CONTEXT_FILE.write_text(path)
+
+
+if __name__ == "__main__":
+    cli()

@@ -1,0 +1,19 @@
+{
+  "primary_model": "gemma3:4b",
+  "code_model": "qwen2.5-coder:3b",
+  "fast_model": "llama3.2:3b",
+  "quality_model": "qwen2.5:7b",
+  "embed_model": "nomic-embed-text",
+  "ollama_url": "http://localhost:11434",
+  "qdrant_url": "http://localhost:6333",
+  "searxng_url": "http://localhost:8080",
+  "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
+  "gemini_model": "gemini-2.5-flash",
+  "gemini_pro_model": "gemini-2.5-pro",
+  "use_gemini_fallback": false,
+  "gemini_for_evolve": true,
+  "gemini_for_implement": false,
+  "top_k_memories": 5,
+  "save_conversations": true,
+  "num_ctx": 4096
+}

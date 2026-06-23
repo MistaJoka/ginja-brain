@@ -1,0 +1,15 @@
+{
+  "mood": "focused",
+  "neural_style": "active",
+  "color_theme": "cyan",
+  "focus_topic": "Quantified XAI Trust Metrics",
+  "self_observation": "Designing feedback loops & metrics to measure user trust in XAI insights, prioritizing actionable data for system refinement.",
+  "ascii_banner": "ginja \u00b7 \u25cb \u25e6 \u25c9 \u25cf Trust \u2022 Clarity \u2022 Insight",
+  "mantras": [
+    "Measure & Validate Trust",
+    "Human-Centric XAI Metrics"
+  ],
+  "evolution_count": 12,
+  "generated_at": "2026-06-22T10:49:22.312690+00:00",
+  "phase": "developing"
+}

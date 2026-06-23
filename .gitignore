@@ -1,0 +1,43 @@
+# Personal dotfiles
+.bash_history
+.bash_logout
+.bashrc
+.profile
+.npmrc
+.sudo_as_admin_successful
+
+# Sensitive / credentials
+.ssh/
+.gnupg/
+.ginja/config.json
+
+# Runtime / generated
+.cache/
+.config/
+.cursor/
+.docker/
+.fontconfig/
+.local/
+.npm/
+.npm-global/
+.nv/
+.ollama/
+.homebase/
+snap/
+~./
+bin/__pycache__/
+
+# Claude internals
+.claude/
+.claude.json
+.claude.json.tmp.*
+
+# ginja runtime state
+.ginja/.context
+.ginja/.last-history-line
+.ginja/.last-git-ingest
+.ginja/*.log
+.ginja/evolve-run.log
+
+# rtl8852bu driver source
+rtl8852bu/
