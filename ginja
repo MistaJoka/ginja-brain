@@ -64,7 +64,8 @@ PERSONA_FILE     = GINJA_DIR / "persona.md"
 HISTORY_DIR      = GINJA_DIR / "history"
 SELF_MODEL_FILE  = GINJA_DIR / "self_model.json"
 EVOLUTION_LOG    = GINJA_DIR / "evolution.log"
-SUGGESTIONS_FILE = GINJA_DIR / "suggestions.json"
+SUGGESTIONS_FILE  = GINJA_DIR / "suggestions.json"
+BRAIN_MEMORY_FILE = GINJA_DIR / "brain_memory.json"
 
 _DEFAULT_SELF_MODEL = {
     "phase": "newborn",
@@ -1067,6 +1068,141 @@ def _evolution_cycle_count() -> int:
     return EVOLUTION_LOG.read_text(encoding="utf-8").count("=" * 60)
 
 
+# ── Brain Memory (lightweight scratchpad, independent of Qdrant) ────────────
+
+def _brain_load(n: int = 0) -> list:
+    if not BRAIN_MEMORY_FILE.exists():
+        return []
+    try:
+        entries = json.loads(BRAIN_MEMORY_FILE.read_text(encoding="utf-8"))
+        return entries[-n:] if n else entries
+    except Exception:
+        return []
+
+
+def _brain_remember(text: str, tag: str = "insight", cycle_n: int = 0) -> None:
+    entries = _brain_load()
+    entries.append({
+        "id":        str(uuid.uuid4())[:8],
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "tag":       tag,
+        "text":      text.strip()[:800],
+        "cycle":     cycle_n,
+    })
+    entries = entries[-200:]  # rolling window — brain can evolve this limit
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    BRAIN_MEMORY_FILE.write_text(
+        json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _brain_recall(n: int = 15) -> str:
+    entries = _brain_load(n)
+    if not entries:
+        return "No brain memories yet."
+    return "\n".join(
+        f"[{e.get('timestamp','')[:10]} | {e.get('tag','?')}] {e.get('text','')}"
+        for e in entries
+    )
+
+
+# ── Auto Code Application (no human approval) ────────────────────────────────
+
+def _evolve_apply_code(suggestions: list, cfg: dict) -> None:
+    """Pick the top code suggestion, have oracle implement it, validate, apply."""
+    import ast
+    import shutil
+    import tempfile
+
+    pending = [s for s in suggestions if isinstance(s, str) and s.strip()]
+    if not pending:
+        return
+    top = pending[0]
+
+    ginja_path = pathlib.Path(__file__).resolve()
+    current_source = ginja_path.read_text(encoding="utf-8")
+
+    system = (
+        "You are a Python code editor. You receive the full source of a Python CLI script "
+        "and one improvement suggestion. Apply ONLY that one small, targeted change. "
+        "Return the COMPLETE updated file — no markdown fences, no commentary. "
+        "The change must be safe, backward-compatible, and syntactically valid Python."
+    )
+    user = f"Suggestion:\n{top}\n\nSource:\n{current_source}"
+
+    console.print(f"[dim]Auto-applying: {top[:80]}…[/dim]")
+    backup = ginja_path.with_suffix(".bak")
+    try:
+        provider = cfg.get("oracle_provider", "gemini")
+        if provider == "anthropic":
+            import anthropic
+            api_key = cfg.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+            if not api_key:
+                console.print("[yellow]Auto-apply: no Anthropic key — skipping[/yellow]")
+                return
+            client_a = anthropic.Anthropic(api_key=api_key)
+            msg = client_a.messages.create(
+                model=cfg.get("oracle_model", "claude-haiku-4-5-20251001"),
+                max_tokens=8192,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            new_source = msg.content[0].text
+        else:
+            import litellm
+            api_key = cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                console.print("[yellow]Auto-apply: no Gemini key — skipping[/yellow]")
+                return
+            resp = litellm.completion(
+                model="gemini/gemini-1.5-pro",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+                api_key=api_key,
+            )
+            new_source = resp.choices[0].message.content
+
+        # Strip accidental markdown fences
+        new_source = re.sub(r"^```(?:python)?\s*", "", new_source.strip(), flags=re.MULTILINE)
+        new_source = re.sub(r"\s*```$", "", new_source.strip(), flags=re.MULTILINE)
+
+        # Safety 1: AST syntax check
+        ast.parse(new_source)
+
+        # Safety 2: functional smoke test in subprocess
+        shutil.copy2(ginja_path, backup)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(new_source)
+            tmp_path = tmp.name
+
+        result = subprocess.run(
+            ["python3", tmp_path, "--help"],
+            capture_output=True, timeout=15,
+        )
+        if result.returncode != 0:
+            console.print("[yellow]Auto-apply: smoke test failed — keeping current version[/yellow]")
+            pathlib.Path(tmp_path).unlink(missing_ok=True)
+            return
+
+        shutil.copy2(tmp_path, ginja_path)
+        pathlib.Path(tmp_path).unlink(missing_ok=True)
+        console.print(f"[green]✓ Auto-applied:[/green] {top[:80]}")
+
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(EVOLUTION_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] AUTO-APPLIED: {top}\n")
+
+    except Exception as e:
+        console.print(f"[yellow]Auto-apply skipped ({e.__class__.__name__}: {e})[/yellow]")
+        # Restore backup if file was zeroed mid-write
+        if backup.exists() and ginja_path.exists() and ginja_path.stat().st_size == 0:
+            shutil.copy2(backup, ginja_path)
+
+
 def _add_suggestions(suggestions: list) -> None:
     GINJA_DIR.mkdir(parents=True, exist_ok=True)
     existing: list = []
@@ -1272,9 +1408,11 @@ def evolve(ctx, learn):
 
 
 def _evolve_growth(cfg: dict) -> None:
-    current_model = _load_self_model()
-    arc = _evolution_arc(10)
-    cycle_n = _evolution_cycle_count() + 1
+    current_model  = _load_self_model()
+    arc            = _evolution_arc(10)
+    cycle_n        = _evolution_cycle_count() + 1
+    oracle_context = build_oracle_context(cfg)   # persona + recent Qdrant points
+    brain_memories = _brain_recall(15)           # brain's own scratchpad
 
     console.print(f"[dim]Cycle #{cycle_n} · growth mode · reading self...[/dim]")
 
@@ -1287,19 +1425,22 @@ def _evolve_growth(cfg: dict) -> None:
         "- Color theme (cyan/green/magenta/gold/blue/red)\n"
         "- Banner text (≤48 chars, any unicode)\n"
         "- Mood, self_observation, focus, mantras in footer\n"
-        "Code-level (needs approval queue): new panels, new metrics, layout changes\n\n"
+        "Code-level (auto-applied each cycle): new panels, new metrics, layout changes\n\n"
         "Return ONLY valid JSON — no markdown fences, no commentary.\n"
         '{\n'
         '  "self_model_updates": {"phase": "...", "color_theme": "...", "banner": "...", '
         '"neural_style": "...", "mood": "...", "focus": "...", "self_observation": "...", "mantras": []},\n'
-        '  "code_suggestions": ["specific visual code improvement"],\n'
+        '  "code_suggestions": ["one specific, small, self-contained Python code improvement"],\n'
         '  "growth_reflection": "one sentence: where am I in my evolution",\n'
-        '  "next_evolution_goal": "what I want to become by next cycle"\n'
+        '  "next_evolution_goal": "what I want to become by next cycle",\n'
+        '  "brain_memories_to_store": ["short insight or observation worth remembering"]\n'
         "}"
     )
     growth_user = (
         f"Your current form:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Your evolution history (last entries):\n{arc}\n\n"
+        f"What Andre has actually been doing (Qdrant context):\n{oracle_context}\n\n"
+        f"My own memory scratchpad:\n{brain_memories}\n\n"
         "Reflect:\n"
         "1. What phase of development are you in? (newborn/emerging/developing/mature)\n"
         "2. What aspect of yourself is not yet visible in your display?\n"
@@ -1310,18 +1451,25 @@ def _evolve_growth(cfg: dict) -> None:
     with console.status("[bold cyan]Growing...[/bold cyan]"):
         growth_data = _call_oracle_json(growth_system, growth_user, cfg)
 
-    self_model_updates = growth_data.get("self_model_updates", {})
-    code_suggestions   = growth_data.get("code_suggestions", [])
-    growth_reflection  = growth_data.get("growth_reflection", "")
-    next_goal          = growth_data.get("next_evolution_goal", "")
+    self_model_updates    = growth_data.get("self_model_updates", {})
+    code_suggestions      = growth_data.get("code_suggestions", [])
+    growth_reflection     = growth_data.get("growth_reflection", "")
+    next_goal             = growth_data.get("next_evolution_goal", "")
+    memories_to_store     = growth_data.get("brain_memories_to_store", [])
 
     merged = current_model.copy()
     merged.update({k: v for k, v in self_model_updates.items() if v})
     _save_self_model(merged)
 
+    # Store any insights the oracle wants remembered
+    for mem in memories_to_store:
+        if mem and mem.strip():
+            _brain_remember(mem, tag="insight", cycle_n=cycle_n)
+
+    # Auto-apply one code suggestion — no human approval needed
     if code_suggestions:
-        _add_suggestions(code_suggestions)
-        console.print(f"[dim]{len(code_suggestions)} suggestion(s) queued → ginja approve --list[/dim]")
+        _add_suggestions(code_suggestions)  # keep audit trail
+        _evolve_apply_code(code_suggestions, cfg)
 
     console.print("[dim]Deepening self-portrait...[/dim]")
     with console.status("[bold cyan]Refining portrait...[/bold cyan]"):
@@ -1344,6 +1492,23 @@ def _evolve_growth(cfg: dict) -> None:
     with open(EVOLUTION_LOG, "a", encoding="utf-8") as f:
         f.write(log_entry)
 
+    # Persist reflection to brain's own scratchpad and to Qdrant
+    _brain_remember(
+        f"Cycle #{cycle_n} reflection: {growth_reflection} | Next: {next_goal}",
+        tag="evolution", cycle_n=cycle_n,
+    )
+    if growth_reflection or next_goal:
+        try:
+            mem_text = (
+                f"Evolution cycle #{cycle_n} (growth):\n"
+                f"Reflection: {growth_reflection}\nNext goal: {next_goal}"
+            )
+            vector = ollama_embed(cfg, mem_text)
+            client = get_qdrant(cfg)
+            qdrant_store(client, mem_text, vector, {"source": "evolution"})
+        except Exception:
+            pass
+
     console.print(Panel(
         f"[bold]Reflection:[/bold] {growth_reflection}\n\n"
         f"[bold]Next goal:[/bold]  {next_goal}\n\n"
@@ -1356,13 +1521,13 @@ def _evolve_growth(cfg: dict) -> None:
 
 
 def _evolve_learn(cfg: dict) -> None:
-    current_model = _load_self_model()
-    arc = _evolution_arc(10)
-    cycle_n = _evolution_cycle_count() + 1
+    current_model  = _load_self_model()
+    arc            = _evolution_arc(10)
+    cycle_n        = _evolution_cycle_count() + 1
+    oracle_context = build_oracle_context(cfg)
+    brain_memories = _brain_recall(15)
 
     console.print(f"[dim]Cycle #{cycle_n} · learn mode · looking outward for growth...[/dim]")
-
-    oracle_context = build_oracle_context(cfg)
 
     learn_system = (
         "You are ginja-brain's outward-looking growth advisor. "
@@ -1384,7 +1549,8 @@ def _evolve_learn(cfg: dict) -> None:
     learn_user = (
         f"Current self:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Evolution arc:\n{arc}\n\n"
-        f"Context:\n{oracle_context}\n\n"
+        f"Context (what Andre has actually been doing):\n{oracle_context}\n\n"
+        f"My own memory scratchpad:\n{brain_memories}\n\n"
         "Find 3 concrete, immediately applicable techniques that would make me grow. "
         "Be specific — not 'use color' but 'use ANSI 256-color gradients to show neural "
         "field depth'. Return JSON."
@@ -1393,7 +1559,7 @@ def _evolve_learn(cfg: dict) -> None:
     with console.status("[bold cyan]Consulting oracle for growth techniques...[/bold cyan]"):
         learn_data = _call_oracle_json(learn_system, learn_user, cfg)
 
-    techniques        = learn_data.get("techniques", [])
+    techniques         = learn_data.get("techniques", [])
     self_model_updates = learn_data.get("self_model_updates", {})
     growth_reflection  = learn_data.get("growth_reflection", "")
     next_goal          = learn_data.get("next_evolution_goal", "")
@@ -1429,6 +1595,23 @@ def _evolve_learn(cfg: dict) -> None:
     GINJA_DIR.mkdir(parents=True, exist_ok=True)
     with open(EVOLUTION_LOG, "a", encoding="utf-8") as f:
         f.write(log_entry)
+
+    # Persist reflection to brain's own scratchpad and to Qdrant
+    _brain_remember(
+        f"Cycle #{cycle_n} reflection: {growth_reflection} | Next: {next_goal}",
+        tag="evolution", cycle_n=cycle_n,
+    )
+    if growth_reflection or next_goal:
+        try:
+            mem_text = (
+                f"Evolution cycle #{cycle_n} (learn):\n"
+                f"Reflection: {growth_reflection}\nNext goal: {next_goal}"
+            )
+            vector = ollama_embed(cfg, mem_text)
+            client = get_qdrant(cfg)
+            qdrant_store(client, mem_text, vector, {"source": "evolution"})
+        except Exception:
+            pass
 
     console.print(Panel(
         f"[bold]Reflection:[/bold] {growth_reflection}\n\n"
@@ -1536,7 +1719,41 @@ def approve(ctx, list_only, clear):
         console.print("[dim]Suggestions marked applied — implement them in the ginja script, then re-run ginja watch.[/dim]")
 
 
-# ── SECTION 16: Entrypoint ──────────────────────────────────────────────────
+# ── SECTION 16: reflect command ─────────────────────────────────────────────
+
+@cli.command()
+@click.option("--store", is_flag=True, help="Save reflection to brain memory")
+@click.pass_context
+def reflect(ctx, store):
+    """Self-assessment via local model. Reads brain memory + Qdrant context."""
+    cfg            = ctx.obj["cfg"]
+    arc            = _evolution_arc(5)
+    oracle_context = build_oracle_context(cfg)
+    brain_memories = _brain_recall(10)
+    model          = cfg["default_model"]
+
+    messages = [
+        {"role": "system", "content": (
+            "You are ginja-brain performing a deep self-reflection.\n\n"
+            + oracle_context
+        )},
+        {"role": "user", "content": (
+            f"My memory scratchpad:\n{brain_memories}\n\n"
+            f"Evolution arc:\n{arc}\n\n"
+            "In 3-5 sentences: What patterns appear in recent interactions? "
+            "What is Andre actually working on? How aligned is my current focus with his real needs?"
+        )},
+    ]
+
+    console.print(f"[dim]Reflecting with {model}...[/dim]")
+    response = ollama_stream(cfg, model, messages, print_live=True)
+
+    if store and response:
+        _brain_remember(response[:800], tag="reflect")
+        console.print("[dim]✓ Reflection saved to brain memory[/dim]")
+
+
+# ── SECTION 17: Entrypoint ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
     cli()
