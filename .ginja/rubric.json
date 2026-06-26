@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "dimensions": [
+    {
+      "id": "specificity",
+      "label": "Specificity",
+      "weight": 0.30,
+      "question": "Do reflections reference concrete tools, files, or commands — or are they vague?"
+    },
+    {
+      "id": "groundedness",
+      "label": "Groundedness",
+      "weight": 0.25,
+      "question": "Are suggestions grounded in data the system actually possesses, not fabricated states?"
+    },
+    {
+      "id": "implementability",
+      "label": "Implementability",
+      "weight": 0.25,
+      "question": "Could the next-goal be acted on in one session with existing tools?"
+    },
+    {
+      "id": "novelty",
+      "label": "Novelty",
+      "weight": 0.20,
+      "question": "Does this cycle show forward movement, or repeat previous goals?"
+    }
+  ]
+}
