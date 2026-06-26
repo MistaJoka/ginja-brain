@@ -41,6 +41,13 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
         "$GINJA" reflect --store >> "$LOG" 2>&1
     fi
 
+    # ── Self-eval (every 5th cycle) ───────────────────────────────────────────
+    if (( CYCLE % 5 == 0 )); then
+        log "eval: scoring evolution quality (cycle $CYCLE)"
+        "$GINJA" eval >> "$LOG" 2>&1 \
+            && log "eval: done" || log "eval: FAILED (non-fatal)"
+    fi
+
     log "approve: starting (auto, code-cap 1)"
     if "$GINJA" approve --auto --code-cap 1 >> "$LOG" 2>&1; then
         log "approve: done"

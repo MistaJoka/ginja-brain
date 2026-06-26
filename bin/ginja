@@ -768,6 +768,8 @@ def search(query, results, do_ingest):
 def research(topic, depth, pages, do_fetch):
     """Research a topic — fast by default (snippets), use --fetch for full pages."""
     cfg = load_config()
+    sm = _load_self_model()
+    _require_phase(sm, "developing", "ginja research")
     t = " ".join(topic)
     mode = "full pages" if do_fetch else "snippets (fast)"
     console.print(Panel(f"[bold cyan]Researching:[/bold cyan] {t}\n[dim]mode: {mode}[/dim]"))
@@ -933,6 +935,18 @@ EVOLUTION_LOG         = GINJA_DIR / "evolution.log"
 SELF_MODEL_FILE       = GINJA_DIR / "self-model.json"
 SUGGESTIONS_FILE      = GINJA_DIR / "suggestions.json"
 VISUAL_APPROVED       = GINJA_DIR / "visual-approved.md"
+CORPUS_MANIFEST       = GINJA_DIR / "corpus-manifest.json"
+PERCEPTION_LOG        = GINJA_DIR / "perception.log"
+RUBRIC_FILE           = GINJA_DIR / "rubric.json"
+SELF_EVAL_LOG         = GINJA_DIR / "self-eval.log"
+
+PHASE_ORDER = ["newborn", "emerging", "developing", "mature"]
+PHASE_THRESHOLDS = [   # descending — first match wins
+    (50, "mature"),
+    (20, "developing"),
+    (5,  "emerging"),
+    (0,  "newborn"),
+]
 
 DEFAULT_SELF_MODEL = {
     "phase": "newborn",
@@ -1081,8 +1095,47 @@ def _generate_self_model(all_summaries: list, recent_text: str, cfg: dict) -> di
 
 
 def _save_self_model(model: dict) -> None:
+    model = _update_self_model(model)
     GINJA_DIR.mkdir(parents=True, exist_ok=True)
     SELF_MODEL_FILE.write_text(json.dumps(model, indent=2))
+
+
+def _phase_index(phase: str) -> int:
+    try:
+        return PHASE_ORDER.index(phase)
+    except ValueError:
+        return 0
+
+
+def _phase_from_count(count: int) -> str:
+    for threshold, name in PHASE_THRESHOLDS:
+        if count >= threshold:
+            return name
+    return "newborn"
+
+
+def _update_self_model(model: dict) -> dict:
+    count = model.get("evolution_count", 0)
+    stored = model.get("phase", "newborn")
+    computed = _phase_from_count(count)
+    new_phase = PHASE_ORDER[max(_phase_index(stored), _phase_index(computed))]
+    model["phase"] = new_phase
+    return model
+
+
+def _require_phase(model: dict, required: str, command: str) -> None:
+    current = model.get("phase", "newborn")
+    if _phase_index(current) < _phase_index(required):
+        needed = next(t for t, n in reversed(PHASE_THRESHOLDS) if n == required)
+        count  = model.get("evolution_count", 0)
+        console.print(Panel(
+            f"[bold yellow]{command}[/bold yellow] unlocks at phase [bold]{required}[/bold] "
+            f"(evolution #{needed})\n\n"
+            f"Current: phase=[bold]{current}[/bold], evolution=#{count}\n"
+            f"Run [bold]ginja evolve[/bold] {needed - count} more time(s) to unlock.",
+            title="Phase gate", border_style="yellow",
+        ))
+        raise SystemExit(0)
 
 
 def _evolution_arc(n: int = 10) -> str:
@@ -1090,6 +1143,86 @@ def _evolution_arc(n: int = 10) -> str:
         return "No evolution history yet."
     entries = [e.strip() for e in EVOLUTION_LOG.read_text().split("=" * 60) if e.strip()]
     return "\n---\n".join(entries[-n:]) if entries else "No evolution history yet."
+
+
+def _load_corpus_manifest() -> dict:
+    if not CORPUS_MANIFEST.exists():
+        return {"topics": []}
+    try:
+        return json.loads(CORPUS_MANIFEST.read_text())
+    except Exception:
+        return {"topics": []}
+
+
+def _perceive(cfg: dict) -> str:
+    parts = []
+
+    try:
+        load = os.getloadavg()
+        parts.append(f"Load: {load[0]:.2f}/{load[1]:.2f}/{load[2]:.2f}")
+    except Exception:
+        parts.append("Load: unavailable")
+
+    try:
+        mem = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                try:
+                    mem[k.strip()] = int(v.strip().split()[0])
+                except (ValueError, IndexError):
+                    pass
+        used_gb  = (mem["MemTotal"] - mem["MemAvailable"]) / 1024 / 1024
+        total_gb = mem["MemTotal"] / 1024 / 1024
+        parts.append(f"RAM: {used_gb:.1f}/{total_gb:.1f}GB")
+    except Exception:
+        parts.append("RAM: unavailable")
+
+    try:
+        gpu_pct, vram_used, vram_total = _gpu_stats()
+        parts.append(f"GPU: {gpu_pct}% · {vram_used/1024:.1f}/{vram_total/1024:.1f}GB VRAM")
+    except Exception:
+        parts.append("GPU: unavailable")
+
+    try:
+        client = get_qdrant(cfg)
+        counts = {c.name: client.count(c.name).count for c in client.get_collections().collections}
+        parts.append("Qdrant: " + ", ".join(f"{k}:{v}" for k, v in counts.items()))
+    except Exception:
+        parts.append("Qdrant: unavailable")
+
+    try:
+        r = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        names = r.stdout.strip().replace("\n", ", ") if r.returncode == 0 else "unavailable"
+        parts.append(f"Docker: {names}")
+    except Exception:
+        parts.append("Docker: unavailable")
+
+    sm = _load_self_model()
+    parts.append(f"Evolution: #{sm.get('evolution_count', 0)} ({sm.get('phase', '?')})")
+
+    hour = datetime.now().hour
+    tod = ("morning" if 5 <= hour < 12 else
+           "afternoon" if hour < 17 else
+           "evening" if hour < 21 else "night")
+    ts = datetime.now().strftime("%H:%M")
+
+    summary = f"[World-state at {ts} ({tod})] " + " | ".join(parts)
+
+    try:
+        GINJA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(PERCEPTION_LOG, "a") as f:
+            f.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "summary": summary,
+            }) + "\n")
+    except Exception:
+        pass
+
+    return summary
 
 
 def _call_oracle_json(prompt: str, cfg: dict) -> dict:
@@ -1154,7 +1287,10 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
     convo_text = "\n".join(e.get("text", "")[:200] for e in recent_convos[:10]) or "No recent conversations."
     mem_text   = "\n".join(e.get("text", "")[:150] for e in recent_mems[:15]) or "No recent memories."
 
+    world_state = _perceive(cfg)
+
     growth_prompt = (
+        f"[WORLD STATE]\n{world_state}\n\n"
         "You are ginja-brain. You are in a GROWTH phase. Focus on evolving your visual self-representation.\n\n"
         f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Your evolution history (last 10 cycles):\n{arc}\n\n"
@@ -1297,7 +1433,24 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
     convo_text = "\n".join(e.get("text", "")[:200] for e in recent_convos[:10]) or "No recent conversations."
     mem_text   = "\n".join(e.get("text", "")[:150] for e in recent_mems[:15]) or "No recent memories."
 
+    world_state = _perceive(cfg)
+
+    manifest_block = ""
+    try:
+        manifest = _load_corpus_manifest()
+        topics = sorted(manifest.get("topics", []), key=lambda t: t.get("priority", 99))
+        if topics and cfg.get("searxng_url"):
+            top = topics[0]
+            query = top["search_queries"][0] if top.get("search_queries") else top["label"]
+            console.print(f"[dim]Corpus bias: researching '{top['label']}'…[/dim]")
+            res = research_topic(query, cfg, depth=1, pages=3)
+            if res:
+                manifest_block = f"\n\nCurated corpus context ({top['label']}):\n{res[:600]}"
+    except Exception:
+        pass
+
     learn_prompt = (
+        f"[WORLD STATE]\n{world_state}\n\n"
         "You are ginja-brain. You want to grow. Look outward and find:\n"
         "(1) terminal/TUI visualization patterns that could enrich my ASCII watch display,\n"
         "(2) learning strategies that could make me retain and apply knowledge better,\n"
@@ -1305,7 +1458,8 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
         f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Your evolution history:\n{arc}\n\n"
         f"Recent conversations with Andre (what he actually asked and I answered):\n{convo_text}\n\n"
-        f"What I know and have recently learned:\n{mem_text}\n\n"
+        f"What I know and have recently learned:\n{mem_text}"
+        f"{manifest_block}\n\n"
         "Return concrete techniques, not topics — things I can apply immediately.\n\n"
         "Return ONLY valid JSON with exactly these keys:\n"
         "{\n"
@@ -1384,10 +1538,13 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
 @click.option("--learn", is_flag=True, help="Look outward for visualization & learning techniques to grow by")
 def evolve(learn):
     """Grow inward by default — deepen self-representation. Use --learn to look outward."""
-    cfg          = load_config()
+    cfg           = load_config()
     current_model = _load_self_model()
-    arc          = _evolution_arc(10)
-    cycle_n      = current_model.get("evolution_count", 0) + 1
+    _require_phase(current_model, "emerging", "ginja evolve")
+    if learn:
+        _require_phase(current_model, "developing", "ginja evolve --learn")
+    arc     = _evolution_arc(10)
+    cycle_n = current_model.get("evolution_count", 0) + 1
 
     if learn:
         _evolve_learn(current_model, arc, cycle_n, cfg)
@@ -1400,7 +1557,11 @@ def evolve(learn):
 def reflect(store):
     """Look inward — what do I know, what am I weak on, what patterns do I notice?"""
     cfg = load_config()
+    sm = _load_self_model()
+    _require_phase(sm, "emerging", "ginja reflect")
     console.print(Panel("[bold cyan]ginja reflect[/bold cyan]"))
+
+    world_state = _perceive(cfg)
 
     try:
         client = get_qdrant(cfg)
@@ -1416,6 +1577,7 @@ def reflect(store):
     evolve_text = "\n".join(e.get("text", "")[:200] for e in evolve_entries[:5]) or "No autonomous learning yet."
 
     prompt = (
+        f"[WORLD STATE]\n{world_state}\n\n"
         "You are an AI assistant doing a self-reflection. Review your recent activity and knowledge.\n\n"
         f"Recent conversations:\n{recent_text}\n\n"
         f"Stored memories:\n{memory_text}\n\n"
@@ -1672,7 +1834,9 @@ def visual_suggestions_cmd():
 @click.option("--code-cap", default=1, show_default=True, help="Max code suggestions to implement per --auto run")
 def approve(list_only, no_curate, auto, code_cap):
     """Brain curates the suggestion queue, then you approve each one."""
-    cfg     = load_config()
+    cfg = load_config()
+    sm  = _load_self_model()
+    _require_phase(sm, "developing", "ginja approve")
     pending = _load_suggestions()
     if not pending:
         console.print("[green]✓ No pending suggestions.[/green]")
@@ -1810,6 +1974,131 @@ def evolution_log(show_all):
             console.print("─" * 40)
 
 
+def _recent_journal(n: int = 2) -> list:
+    if not EVOLUTION_LOG.exists():
+        return []
+    return [e.strip() for e in EVOLUTION_LOG.read_text().split("=" * 60) if e.strip()][-n:]
+
+
+@cli.command()
+@click.option("--last", default=5, help="Number of entries to show")
+def journal(last):
+    """Render evolution journal entries richly in the terminal."""
+    entries = _recent_journal(last)
+    if not entries:
+        console.print("[yellow]No evolution entries yet. Run 'ginja evolve'.[/yellow]")
+        return
+    theme = COLOR_THEMES.get(_load_self_model().get("color_theme", "cyan"), COLOR_THEMES["cyan"])
+    for entry in entries:
+        lines = entry.splitlines()
+        title = lines[0] if lines else "Entry"
+        console.print(Panel(entry, title=f"[dim]{title}[/dim]", border_style=theme["neural"]))
+
+
+@cli.command("eval")
+def eval_cmd():
+    """Score recent evolution quality against the rubric. Runs automatically every 5th cycle."""
+    cfg = load_config()
+    sm  = _load_self_model()
+    _require_phase(sm, "mature", "ginja eval")
+
+    entries = _recent_journal(5)
+    if not entries:
+        console.print("[yellow]No evolution entries to evaluate.[/yellow]")
+        return
+
+    try:
+        rubric = json.loads(RUBRIC_FILE.read_text())
+    except Exception:
+        console.print(f"[red]rubric.json missing — create {RUBRIC_FILE}[/red]")
+        return
+
+    dims         = rubric.get("dimensions", [])
+    journal_text = "\n\n---\n\n".join(entries)
+    questions    = "\n".join(f"- {d['id']} ({d['label']}): {d['question']}" for d in dims)
+    prompt = (
+        "You are evaluating the quality of an AI's recent evolution cycles.\n\n"
+        f"Evolution entries:\n{journal_text}\n\n"
+        f"Score each dimension 0-10:\n{questions}\n\n"
+        'Return ONLY valid JSON:\n'
+        '{"scores": {"specificity": 7, "groundedness": 6, "implementability": 8, "novelty": 5}, '
+        '"summary": "one sentence", '
+        '"weakest_dimension": "id", '
+        '"recommendation": "one concrete next step"}'
+    )
+    try:
+        result = _call_oracle_json(prompt, cfg)
+    except click.ClickException as e:
+        console.print(f"[red]{e}[/red]")
+        return
+
+    scores   = result.get("scores", {})
+    weighted = sum(scores.get(d["id"], 0) * d["weight"] for d in dims if d["id"] in scores)
+    prev     = sm.get("eval_score")
+    delta    = f"  Δ {weighted - prev:+.1f}" if prev is not None else ""
+
+    table = Table(title="Self-Eval Rubric", show_lines=True)
+    table.add_column("Dimension")
+    table.add_column("Score", justify="right")
+    table.add_column("Weight", justify="right")
+    for d in dims:
+        table.add_row(d["label"], str(scores.get(d["id"], 0)), f"{d['weight']:.0%}")
+    table.add_row("[bold]WEIGHTED[/bold]", f"[bold]{weighted:.1f}[/bold]{delta}", "")
+    console.print(table)
+    console.print(f"\n[dim]Weakest:[/dim] {result.get('weakest_dimension', '?')}")
+    console.print(f"[dim]Recommendation:[/dim] {result.get('recommendation', '')}")
+
+    try:
+        with open(SELF_EVAL_LOG, "a") as f:
+            f.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "evolution_count": sm.get("evolution_count", 0),
+                "weighted_score": round(weighted, 2),
+                "scores": scores,
+                "summary": result.get("summary", ""),
+            }) + "\n")
+    except Exception as ex:
+        console.print(f"[yellow]Warning: could not write self-eval.log: {ex}[/yellow]")
+
+    sm["eval_score"] = round(weighted, 2)
+    if prev is not None:
+        sm["eval_trend"] = round(weighted - prev, 2)
+    _save_self_model(sm)
+
+
+@cli.group()
+def corpus():
+    """Manage the curated corpus reading list."""
+    pass
+
+
+@corpus.command("score")
+def corpus_score():
+    """Show how many memories match each corpus topic."""
+    cfg = load_config()
+    sm  = _load_self_model()
+    _require_phase(sm, "mature", "ginja corpus score")
+
+    manifest = _load_corpus_manifest()
+    topics   = manifest.get("topics", [])
+    if not topics:
+        console.print(f"[yellow]No topics in {CORPUS_MANIFEST}[/yellow]")
+        return
+
+    table = Table(title="Corpus Coverage", show_lines=True)
+    table.add_column("Topic")
+    table.add_column("Hits", justify="right")
+    for t in sorted(topics, key=lambda x: x.get("priority", 99)):
+        query = t["search_queries"][0] if t.get("search_queries") else t["label"]
+        try:
+            hits  = search_memory(query, cfg, top_k=10)
+            count = len(hits)
+        except Exception:
+            count = 0
+        table.add_row(t["label"], str(count))
+    console.print(table)
+
+
 # ── Watch helpers ──────────────────────────────────────────────────────────────
 NEURAL_CHARS = " .·○◦◉●◦○·."
 WAVE_CHARS   = " ▁▂▃▄▅▆▇█"
@@ -1930,23 +2219,46 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
         bar = "█" * bar_len + "░" * (8 - bar_len)
         vitals.add_row(name[:8], f"[{theme['mem']}]{bar}[/]  {count}")
 
+    recent_entries = _recent_journal(2)
+    if recent_entries:
+        vitals.add_row("", "")
+        vitals.add_row("[dim]JOURNAL[/dim]", "")
+        for entry in recent_entries:
+            elines = [l for l in entry.splitlines() if l.strip()]
+            header_line = elines[0][:38] if elines else ""
+            refline = next((l for l in elines if l.startswith("Reflection:")), "")
+            refline = refline.replace("Reflection:", "").strip()[:38]
+            vitals.add_row("[dim]·[/dim]", f"[dim]{header_line}[/dim]")
+            if refline:
+                vitals.add_row("", f"[italic dim]{refline}[/italic dim]")
+
     # ── Footer — brain's self-authored text ────────────────────────────────────
     mood      = self_model.get("mood", "")
     obs       = self_model.get("self_observation", "")
     focus     = self_model.get("focus_topic", "")
+    phase_str = self_model.get("phase", "newborn")
+    next_phase = PHASE_ORDER[min(_phase_index(phase_str) + 1, len(PHASE_ORDER) - 1)]
+    next_thresh = next((t for t, n in reversed(PHASE_THRESHOLDS) if n == next_phase), None)
+    if next_thresh and next_thresh > evo_n:
+        unlock_str = f"next: {next_phase} in {next_thresh - evo_n} cycles"
+    else:
+        unlock_str = "fully matured"
     footer_text = Text()
     footer_text.append(f"{mood.upper()}  ", style=f"bold {theme['header']}")
     footer_text.append(obs[:70], style="italic white")
     footer_text.append(f"\nFOCUS  ", style="dim")
     footer_text.append(focus[:45], style=theme["neural"])
     footer_text.append(f"    [dim]{mantra}[/dim]")
+    footer_text.append(f"\nPHASE  ", style="dim")
+    footer_text.append(phase_str, style=f"bold {theme['header']}")
+    footer_text.append(f"  ·  {unlock_str}", style="dim")
 
     # ── Assemble ───────────────────────────────────────────────────────────────
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="body"),
-        Layout(name="footer", size=4),
+        Layout(name="footer", size=5),
     )
     layout["body"].split_row(
         Layout(name="neural", ratio=3),

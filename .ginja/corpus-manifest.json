@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "topics": [
+    {
+      "id": "homelab-automation",
+      "label": "Homelab automation and self-hosted services",
+      "priority": 1,
+      "search_queries": [
+        "n8n workflow automation homelab",
+        "self-hosted AI orchestration 2025"
+      ]
+    },
+    {
+      "id": "local-llm",
+      "label": "Local LLM deployment and optimization",
+      "priority": 2,
+      "search_queries": [
+        "ollama local model optimization",
+        "quantized LLM inference homelab GPU"
+      ]
+    },
+    {
+      "id": "vector-memory",
+      "label": "Vector databases and semantic memory systems",
+      "priority": 3,
+      "search_queries": [
+        "Qdrant collection management best practices",
+        "semantic memory RAG patterns"
+      ]
+    },
+    {
+      "id": "agent-architecture",
+      "label": "Autonomous agent design patterns",
+      "priority": 4,
+      "search_queries": [
+        "autonomous AI agent self-improvement",
+        "agentic loop reflection mechanisms"
+      ]
+    }
+  ]
+}
