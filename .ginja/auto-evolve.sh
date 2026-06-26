@@ -1,39 +1,70 @@
 #!/usr/bin/env bash
-# Autonomous evolution loop — runs for DURATION_HOURS, then exits.
-# Each cycle: ginja evolve → ginja approve --auto --code-cap 1
-# Log: ~/.ginja/auto-evolve.log
+# Autonomous evolution loop — hardened edition
+# Usage: auto-evolve.sh [DURATION_HOURS] [INTERVAL_MIN]
+#
+# Safety layers (in order):
+#   1. Lock file      — prevents concurrent sessions from clobbering each other
+#   2. Load check     — skips cycles when system is already stressed (load >= 5)
+#   3. Pre-backup     — snapshots bin/ginja before every approve
+#   4. Change-size    — rolls back if delta > 80 lines (catastrophic rewrite guard)
+#   5. Syntax check   — rolls back on any Python parse error
+#   6. Runtime check  — rolls back if ginja --help fails (catches import errors)
+#   7. Streak abort   — pauses and alerts if 3 consecutive rollbacks occur
+
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
 GINJA="$HOME/bin/ginja"
-LOG="$HOME/.ginja/auto-evolve.log"
-DURATION_HOURS="${1:-4}"
-INTERVAL_MIN="${2:-25}"
+GINJA_DIR="$HOME/.ginja"
+LOG="$GINJA_DIR/auto-evolve.log"
+LOCKFILE="$GINJA_DIR/auto-evolve.lock"
+BACKUP_DIR="$HOME/bin"
+DURATION_HOURS="${1:-2}"
+INTERVAL_MIN="${2:-30}"
+MAX_ROLLBACK_STREAK=3
 
 DEADLINE=$(( $(date +%s) + DURATION_HOURS * 3600 ))
 CYCLE=0
+ROLLBACK_STREAK=0
+
+# ── 1. Lock file ──────────────────────────────────────────────────────────────
+if [ -f "$LOCKFILE" ]; then
+    HELD_PID=$(cat "$LOCKFILE" 2>/dev/null)
+    if [ -n "$HELD_PID" ] && kill -0 "$HELD_PID" 2>/dev/null; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Lock held by PID $HELD_PID — exiting" >> "$LOG"
+        exit 0
+    fi
+    rm -f "$LOCKFILE"
+fi
+echo $$ > "$LOCKFILE"
+trap "rm -f '$LOCKFILE'" EXIT INT TERM
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 
-log "=== Auto-evolution started (${DURATION_HOURS}h, every ${INTERVAL_MIN}min, code-cap 1) ==="
+log "=== Auto-evolution started (${DURATION_HOURS}h window, ${INTERVAL_MIN}min interval, code-cap 1) ==="
 
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     CYCLE=$(( CYCLE + 1 ))
     REMAINING_MIN=$(( ( DEADLINE - $(date +%s) ) / 60 ))
     log "--- Cycle #${CYCLE} (${REMAINING_MIN}min remaining) ---"
 
-    log "evolve: starting"
+    # ── 2. Load check ─────────────────────────────────────────────────────────
+    LOAD=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo "0.0")
+    LOAD_INT=$(printf "%.0f" "$LOAD" 2>/dev/null || echo "0")
+    if [ "${LOAD_INT:-0}" -ge 5 ]; then
+        log "High load ($LOAD) — skipping cycle, sleeping 5min"
+        sleep 300
+        continue
+    fi
+
+    # ── Evolve (inward or outward) ────────────────────────────────────────────
     if (( CYCLE % 3 == 0 )); then
-        log "evolve: outward learning mode (cycle $CYCLE)"
-        if "$GINJA" evolve --learn >> "$LOG" 2>&1; then
-            log "evolve: done"
-        else
-            log "evolve: FAILED (exit $?)"
-        fi
+        log "evolve: outward learning (--learn)"
+        "$GINJA" evolve --learn >> "$LOG" 2>&1 \
+            && log "evolve: done" || log "evolve: FAILED (non-fatal)"
     else
-        if "$GINJA" evolve >> "$LOG" 2>&1; then
-            log "evolve: done"
-        else
-            log "evolve: FAILED (exit $?)"
-        fi
+        log "evolve: inward"
+        "$GINJA" evolve >> "$LOG" 2>&1 \
+            && log "evolve: done" || log "evolve: FAILED (non-fatal)"
     fi
 
     if (( CYCLE % 4 == 0 )); then
@@ -48,18 +79,59 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             && log "eval: done" || log "eval: FAILED (non-fatal)"
     fi
 
+    # ── 3. Pre-approve backup ─────────────────────────────────────────────────
+    BACKUP="$BACKUP_DIR/ginja.bak.$(date +%s)"
+    LINES_BEFORE=$(wc -l < "$GINJA")
+    cp "$GINJA" "$BACKUP"
+
     log "approve: starting (auto, code-cap 1)"
-    if "$GINJA" approve --auto --code-cap 1 >> "$LOG" 2>&1; then
-        log "approve: done"
-    else
-        log "approve: FAILED (exit $?)"
+    "$GINJA" approve --auto --code-cap 1 >> "$LOG" 2>&1 \
+        && log "approve: done" || log "approve: finished (may have had no implementations)"
+
+    # ── 4-6. Safety checks ────────────────────────────────────────────────────
+    SAFE=true
+    REASON=""
+
+    LINES_AFTER=$(wc -l < "$GINJA")
+    LINE_DELTA=$(( LINES_AFTER - LINES_BEFORE ))
+    LINE_DELTA_ABS=${LINE_DELTA#-}
+
+    if [ "${LINE_DELTA_ABS:-0}" -gt 80 ]; then
+        SAFE=false
+        REASON="large change (${LINE_DELTA} lines — limit is ±80)"
+    elif ! python3 -c "import ast; ast.parse(open('$GINJA').read())" 2>/dev/null; then
+        SAFE=false
+        REASON="Python syntax error"
+    elif ! python3 "$GINJA" --help >/dev/null 2>&1; then
+        SAFE=false
+        REASON="runtime import failure"
     fi
 
-    # Check if there's enough time for another cycle before sleeping
+    if [ "$SAFE" = "false" ]; then
+        log "ROLLBACK — $REASON"
+        cp "$BACKUP" "$GINJA"
+        log "Restored from $BACKUP"
+        ROLLBACK_STREAK=$(( ROLLBACK_STREAK + 1 ))
+
+        # ── 7. Streak abort ───────────────────────────────────────────────────
+        if [ "$ROLLBACK_STREAK" -ge "$MAX_ROLLBACK_STREAK" ]; then
+            log "=== $MAX_ROLLBACK_STREAK consecutive rollbacks — pausing evolution to prevent damage ==="
+            log "=== Run 'ginja approve --list' to inspect suggestions, or clear with 'ginja approve --clear' ==="
+            break
+        fi
+    else
+        log "Safety OK — delta ${LINE_DELTA} lines, syntax clean, runtime clean"
+        ROLLBACK_STREAK=0
+    fi
+
+    # ── Rotate backups (keep last 7) ─────────────────────────────────────────
+    ls -t "$BACKUP_DIR/ginja.bak."* 2>/dev/null | tail -n +8 | xargs rm -f 2>/dev/null
+
+    # ── Sleep if time remains ─────────────────────────────────────────────────
     NOW=$(date +%s)
     SLEEP_SECS=$(( INTERVAL_MIN * 60 ))
     if [ $(( NOW + SLEEP_SECS )) -ge "$DEADLINE" ]; then
-        log "Not enough time for another full cycle — stopping."
+        log "Not enough time for another full cycle — stopping"
         break
     fi
 
@@ -67,4 +139,4 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     sleep "${SLEEP_SECS}"
 done
 
-log "=== Auto-evolution complete after ${CYCLE} cycle(s) ==="
+log "=== Complete after ${CYCLE} cycle(s) — ${ROLLBACK_STREAK} consecutive rollbacks at exit ==="

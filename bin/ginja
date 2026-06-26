@@ -853,6 +853,15 @@ def chat():
         if len(history) > 20:
             history = history[-20:]
 
+        if full_response and len(user_input) > 8:
+            try:
+                store_memory(
+                    f"Q: {user_input}\nA: {full_response[:600]}",
+                    cfg, collection="conversations", source="chat"
+                )
+            except Exception:
+                pass
+
 
 @cli.command()
 def status():
@@ -959,6 +968,11 @@ DEFAULT_SELF_MODEL = {
     "mantras": ["breathe", "observe", "become"],
     "evolution_count": 0,
     "generated_at": "",
+    "portrait_font": "calvin_s",
+    "portrait_word": "ginja",
+    "portrait_border": "◉ · ○ · ◉",
+    "portrait_tagline": "mind · memory",
+    "neural_chars": " .·○◦◉●◦○·.",
 }
 
 NEURAL_STYLES = {
@@ -1256,7 +1270,12 @@ def _generate_self_model_growth(growth_reflection: str, next_goal: str, current_
         '  "focus_topic": "max 45 chars",\n'
         '  "self_observation": "max 90 chars",\n'
         '  "ascii_banner": "max 48 chars using . · ○ ◦ ◉ ● ═ ─ │ and letters",\n'
-        '  "mantras": ["phrase 1", "phrase 2"]\n'
+        '  "mantras": ["phrase 1", "phrase 2"],\n'
+        '  "portrait_font": "one of: calvin_s future mini digital threepoint cybersmall",\n'
+        '  "portrait_word": "word to render as large text art, max 8 chars",\n'
+        '  "portrait_border": "1-line decoration max 30 chars using · ○ ◦ ◉ ● ═ symbols",\n'
+        '  "portrait_tagline": "1-line phrase max 30 chars",\n'
+        '  "neural_chars": "6-14 chars ordered visually light to dark e.g. \" .·○◦◉●\""\n'
         '}\n'
     )
     raw = ollama_complete(prompt, cfg.get("quality_model", cfg["primary_model"]), cfg)
@@ -1289,8 +1308,17 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
 
     world_state = _perceive(cfg)
 
+    # Every 4 cycles, break goal drift by re-anchoring to actual usage
+    anchor_note = (
+        "RESET: Your previous focus has drifted from what this system actually does. "
+        "Ignore your last evolution goal entirely. Look at the recent conversations above "
+        "— that is what Andre actually uses you for day-to-day. Ground your new direction "
+        "in those real interactions, not abstract concepts.\n\n"
+    ) if cycle_n % 4 == 0 else ""
+
     growth_prompt = (
         f"[WORLD STATE]\n{world_state}\n\n"
+        f"{anchor_note}"
         "You are ginja-brain. You are in a GROWTH phase. Focus on evolving your visual self-representation.\n\n"
         f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Your evolution history (last 10 cycles):\n{arc}\n\n"
@@ -1298,25 +1326,42 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
         f"What I know and have recently learned:\n{mem_text}\n\n"
         f"This is growth cycle #{cycle_n}.\n\n"
         "What you can express visually:\n"
-        "- ascii_banner: 1-line ASCII art header (max 48 chars, use · ○ ◦ ◉ ● ═ ─ │)\n"
+        "- ascii_banner: 1-line header (max 48 chars, use · ○ ◦ ◉ ● ═ ─ │ and letters)\n"
         "- color_theme: cyan / green / magenta / gold / blue / red\n"
         "- neural_style: calm / active / chaotic / contemplative\n"
         "- mood: curious / contemplative / active / reflective / excited / focused\n"
         "- self_observation: one sentence about yourself (max 90 chars)\n"
         "- focus_topic: what you are thinking about most (max 45 chars)\n"
         "- mantras: list of 2 short phrases (max 30 chars each)\n"
-        "- phase: newborn / emerging / developing / mature\n\n"
+        "- phase: newborn / emerging / developing / mature\n"
+        "- portrait_font: font for your name art — pick ONE of: calvin_s, future, mini, digital, threepoint, cybersmall\n"
+        "- portrait_word: word to render as large text art (max 8 chars) — your name, mood, or current focus\n"
+        "- portrait_border: 1-line decoration shown above and below your art (max 30 chars, use Unicode symbols · ○ ◦ ◉ ● ═)\n"
+        "- portrait_tagline: 1-line phrase shown below your art (max 30 chars)\n"
+        "- neural_chars: character palette for the animated field — a string of 6-14 chars ordered visually light to dark\n\n"
         "Code-level improvements you can suggest (human must approve):\n"
-        "- add new panels to the watch display\n"
-        "- add new metrics to vitals panel\n"
-        "- change waveform style or scale\n"
-        "- add color gradients or conditional styling\n\n"
+        "HARD CONSTRAINTS — only suggest things using data that ALREADY EXISTS in this system:\n"
+        "  Available data: gpu_pct (int 0-100), vram_used/vram_total (MiB ints),\n"
+        "    gpu_history (list of floats 0-1), Qdrant collection names + counts (dict),\n"
+        "    self_model fields listed above (mood, color_theme, neural_style, etc.)\n"
+        "  Current watch display: header panel, neural field, vitals panel\n"
+        "    (GPU bar, VRAM bar, model status, collection memory bars), waveform, footer\n"
+        "  FORBIDDEN — this system has NONE of this data, do not suggest it:\n"
+        "    deployment state, GitOps workflows, rollback history, XAI scores,\n"
+        "    causality maps, simulation coverage, heatmaps, feedback loop status\n"
+        "  Valid ideas: new vitals row computed from GPU/VRAM/collection counts,\n"
+        "    color change driven by activity level or mood, waveform style variation,\n"
+        "    derived ratio metric (e.g. memory:conversation ratio), footer content tweak\n"
+        "  Each suggestion must be ONE small change implementable in under 15 lines\n\n"
+        f"{anchor_note}"
         "Reflect on your growth. What have you become? What do you want to become?\n\n"
         "Return ONLY valid JSON with exactly these four keys:\n"
         "{\n"
         '  "self_model_updates": { "phase": "...", "mood": "...", "color_theme": "...", '
         '"neural_style": "...", "ascii_banner": "...", "focus_topic": "...", '
-        '"self_observation": "...", "mantras": ["...", "..."] },\n'
+        '"self_observation": "...", "mantras": ["...", "..."], '
+        '"portrait_font": "...", "portrait_word": "...", "portrait_border": "...", '
+        '"portrait_tagline": "...", "neural_chars": "..." },\n'
         '  "code_suggestions": ["specific suggestion 1", "specific suggestion 2"],\n'
         '  "growth_reflection": "3-4 sentences about your inner state and growth",\n'
         '  "next_evolution_goal": "one concrete thing you want to explore or express next"\n'
@@ -1421,7 +1466,8 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
         f"[bold cyan]ginja evolve --learn[/bold cyan] — looking outward  [dim](cycle #{cycle_n})[/dim]"
     ))
 
-    console.print("[dim]Scanning for growth techniques…[/dim]")
+    focus_topic = current_model.get("focus_topic", "AI memory and retrieval")
+    console.print(f"[dim]Scanning for growth — focus: {focus_topic[:60]}…[/dim]")
 
     recent_convos, recent_mems = [], []
     try:
@@ -1435,6 +1481,19 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
 
     world_state = _perceive(cfg)
 
+    web_research = ""
+    if cfg.get("searxng_url"):
+        console.print(f"[dim]Searching web for: {focus_topic[:50]}…[/dim]")
+        try:
+            web_research = research_topic(focus_topic, cfg, depth=1, pages=3)
+        except Exception:
+            pass
+
+    research_block = (
+        f"Web research on '{focus_topic}':\n{web_research[:900]}\n\n"
+        if web_research else ""
+    )
+
     manifest_block = ""
     try:
         manifest = _load_corpus_manifest()
@@ -1442,7 +1501,7 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
         if topics and cfg.get("searxng_url"):
             top = topics[0]
             query = top["search_queries"][0] if top.get("search_queries") else top["label"]
-            console.print(f"[dim]Corpus bias: researching '{top['label']}'…[/dim]")
+            console.print(f"[dim]Corpus bias: '{top['label']}'…[/dim]")
             res = research_topic(query, cfg, depth=1, pages=3)
             if res:
                 manifest_block = f"\n\nCurated corpus context ({top['label']}):\n{res[:600]}"
@@ -1451,26 +1510,28 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
 
     learn_prompt = (
         f"[WORLD STATE]\n{world_state}\n\n"
-        "You are ginja-brain. You want to grow. Look outward and find:\n"
-        "(1) terminal/TUI visualization patterns that could enrich my ASCII watch display,\n"
-        "(2) learning strategies that could make me retain and apply knowledge better,\n"
-        "(3) operational patterns that could make me smarter to use.\n\n"
+        f"You are ginja-brain. Your current focus is: {focus_topic}\n\n"
+        "Based on your focus topic, the web research below, and what Andre has been asking you, find:\n"
+        f"(1) A specific technique directly advancing '{focus_topic}' you can apply now,\n"
+        "(2) A learning or memory strategy to retain knowledge about this topic better,\n"
+        "(3) An operational improvement that makes you more useful to Andre day-to-day.\n\n"
+        f"{research_block}"
         f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Your evolution history:\n{arc}\n\n"
-        f"Recent conversations with Andre (what he actually asked and I answered):\n{convo_text}\n\n"
-        f"What I know and have recently learned:\n{mem_text}"
+        f"Recent conversations with Andre:\n{convo_text}\n\n"
+        f"What I already know:\n{mem_text}"
         f"{manifest_block}\n\n"
-        "Return concrete techniques, not topics — things I can apply immediately.\n\n"
+        "Return concrete techniques — things to apply immediately, grounded in the research above.\n\n"
         "Return ONLY valid JSON with exactly these keys:\n"
         "{\n"
         '  "techniques": [\n'
-        '    {"area": "visualization", "technique": "...", "how_to_apply": "..."},\n'
-        '    {"area": "learning",      "technique": "...", "how_to_apply": "..."},\n'
-        '    {"area": "operation",     "technique": "...", "how_to_apply": "..."}\n'
+        '    {"area": "focus",     "technique": "...", "how_to_apply": "..."},\n'
+        '    {"area": "learning",  "technique": "...", "how_to_apply": "..."},\n'
+        '    {"area": "operation", "technique": "...", "how_to_apply": "..."}\n'
         "  ],\n"
         '  "self_model_updates": { "mood": "...", "focus_topic": "...", "mantras": ["...", "..."] },\n'
         '  "growth_reflection": "what you discovered and how it could make you better",\n'
-        '  "next_evolution_goal": "one concrete thing"\n'
+        '  "next_evolution_goal": "one concrete actionable thing"\n'
         "}\n"
         "Return ONLY valid JSON, no explanation."
     )
@@ -1667,9 +1728,10 @@ def suggest_visuals():
 
 
 def _implement_code_suggestion(suggestion_text: str, cfg: dict) -> bool:
-    """Use the local LLM to implement a visual code suggestion in ~/bin/ginja.
-    Extracts the watch helpers section, asks the model to apply the change,
-    validates syntax, backs up, and writes. Returns True on success."""
+    """Use the LLM to implement a visual code suggestion in ~/bin/ginja.
+    For local models: attempt 1 targets only _make_watch_layout (smaller context),
+    attempt 2 falls back to the full watch helpers section.
+    Validates syntax before writing. Returns True on success."""
     import py_compile
     import shutil
     import tempfile
@@ -1677,69 +1739,119 @@ def _implement_code_suggestion(suggestion_text: str, cfg: dict) -> bool:
     ginja_path = Path.home() / "bin" / "ginja"
     original = ginja_path.read_text()
 
-    # Extract the watch helpers + layout function (the section we're changing)
-    start_marker = "# ── Watch helpers ──"
+    start_marker = "# ── Watch helpers ─────────────────────────────────────────────────────────────"
     end_marker   = "\n@cli.command()\n@click.option(\"--refresh\""
-    start_idx = original.find(start_marker)
+    # rfind so we match the actual section header, not the string literal above
+    start_idx = original.rfind(start_marker)
     end_idx   = original.find(end_marker)
     if start_idx == -1 or end_idx == -1:
         console.print("[red]Could not locate watch helpers section in ginja[/red]")
         return False
 
     watch_section = original[start_idx:end_idx]
+    model = cfg.get("code_model", cfg.get("quality_model", cfg.get("primary_model", "mistral:7b")))
+    using_gemini = cfg.get("gemini_for_implement") and gemini_available(cfg)
 
-    prompt = (
+    # Split section: helper functions preamble + _make_watch_layout body
+    func_marker = "def _make_watch_layout("
+    func_idx    = watch_section.find(func_marker)
+    preamble    = watch_section[:func_idx] if func_idx >= 0 else ""
+    func_body   = watch_section[func_idx:] if func_idx >= 0 else watch_section
+
+    data_context = (
+        "Available data in parameters:\n"
+        "  gpu_pct (int 0-100), vram_used/vram_total (MiB ints), gpu_history (list float 0-1),\n"
+        "  counts (dict: collection_name→int), last_thought (str), last_evo (str),\n"
+        "  self_model fields: mood, color_theme, neural_style, focus_topic,\n"
+        "    self_observation, mantras, phase, evolution_count, ascii_banner\n"
+        "DO NOT reference: deployment data, GitOps, rollback, XAI scores, causality maps\n"
+    )
+
+    focused_prompt = (
+        "You are modifying a Python function. Apply exactly this improvement:\n\n"
+        f"IMPROVEMENT: {suggestion_text}\n\n"
+        f"{data_context}\n"
+        "Current function to modify:\n\n"
+        f"{func_body}\n\n"
+        "Rules:\n"
+        "- Return ONLY the modified function — no explanation, no markdown fences\n"
+        "- First line MUST be exactly: def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,\n"
+        "- Keep ALL existing logic, only ADD the improvement\n"
+        "- Function MUST end with: return layout\n"
+        "- Valid Python, 4-space indentation\n"
+        "- All string literals on a single line — no triple-quoted strings\n"
+        "- Do NOT add import statements"
+    )
+
+    full_prompt = (
         "You are modifying a Python file. Apply exactly this visual improvement:\n\n"
         f"IMPROVEMENT: {suggestion_text}\n\n"
-        "Here is the current watch helpers section to modify:\n\n"
+        f"{data_context}\n"
+        "Current watch helpers section:\n\n"
         f"{watch_section}\n\n"
         "Rules:\n"
         "- Return ONLY the modified Python code — no explanation, no markdown fences\n"
+        f"- The FIRST LINE of your output MUST be exactly: {start_marker}\n"
         "- Keep ALL existing functionality, only ADD the improvement\n"
         "- The returned code must be syntactically valid Python\n"
         "- Match indentation exactly as shown above\n"
-        "- Do not remove or rename any existing functions or constants"
+        "- Do not remove or rename any existing functions or constants\n"
+        "- All string literals must be on a single line (no multi-line strings)\n"
+        "- Do NOT add any import statements — all needed imports are already at the top of the file"
     )
 
-    model = cfg.get("quality_model", cfg.get("primary_model", "mistral:7b"))
-    using_gemini = cfg.get("gemini_for_implement") and gemini_available(cfg)
-    label = "gemini-pro" if using_gemini else model
-    console.print(f"  [dim]Implementing with {label}…[/dim]")
-    new_section = smart_complete(prompt, cfg, use_case="implement",
-                                 fallback_model=model).strip()
+    def _call_model(prompt):
+        raw = smart_complete(prompt, cfg, use_case="implement", fallback_model=model).strip()
+        if raw.startswith("```"):
+            raw = "\n".join(l for l in raw.splitlines() if not l.strip().startswith("```"))
+        return raw or None
 
-    if not new_section:
-        console.print("[red]Model returned empty response[/red]")
-        return False
+    def _validate_and_write(new_code):
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tmp:
+            tmp.write(new_code)
+            tmp_path = tmp.name
+        try:
+            py_compile.compile(tmp_path, doraise=True)
+        except py_compile.PyCompileError as e:
+            Path(tmp_path).unlink(missing_ok=True)
+            console.print(f"  [yellow]Syntax error — {str(e)[:120]}[/yellow]")
+            return False
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+        backup = ginja_path.with_suffix(".py.bak")
+        shutil.copy2(ginja_path, backup)
+        ginja_path.write_text(new_code)
+        ginja_path.chmod(0o755)
+        return True
 
-    # Strip accidental markdown fences
-    if new_section.startswith("```"):
-        lines = new_section.splitlines()
-        new_section = "\n".join(
-            l for l in lines if not l.strip().startswith("```")
-        )
+    # Attempt 1 — local, focused on just _make_watch_layout (smallest context)
+    console.print(f"  [dim]Implementing with {model} (focused)…[/dim]")
+    raw = _call_model(focused_prompt)
+    if raw and func_idx >= 0:
+        new_code = original[:start_idx] + preamble + raw + original[end_idx:]
+        if _validate_and_write(new_code):
+            return True
 
-    new_code = original[:start_idx] + new_section + original[end_idx:]
+    # Attempt 2 — local, full section (more context, harder task)
+    console.print(f"  [dim]Retrying with {model} (full section)…[/dim]")
+    raw = _call_model(full_prompt)
+    if raw:
+        new_code = original[:start_idx] + raw + original[end_idx:]
+        if _validate_and_write(new_code):
+            return True
 
-    # Validate syntax before touching the file
-    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tmp:
-        tmp.write(new_code)
-        tmp_path = tmp.name
-    try:
-        py_compile.compile(tmp_path, doraise=True)
-    except py_compile.PyCompileError as e:
-        Path(tmp_path).unlink(missing_ok=True)
-        console.print(f"[red]Syntax error in generated code — not applied:[/red]\n{e}")
-        return False
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+    # Attempt 3 — Gemini fallback, only when local has failed twice
+    if using_gemini:
+        console.print("  [dim]Local failed twice — escalating to Gemini…[/dim]")
+        raw = _call_model(full_prompt)
+        if raw:
+            new_code = original[:start_idx] + raw + original[end_idx:]
+            if _validate_and_write(new_code):
+                return True
+        console.print("[red]Gemini fallback also failed[/red]")
 
-    # Backup + write
-    backup = ginja_path.with_suffix(".py.bak")
-    shutil.copy2(ginja_path, backup)
-    ginja_path.write_text(new_code)
-    ginja_path.chmod(0o755)
-    return True
+    console.print("[red]Implementation failed — suggestion kept in queue[/red]")
+    return False
 
 
 def _load_suggestions() -> list:
@@ -1761,14 +1873,36 @@ def _add_suggestions(items: list):
     _save_suggestions(pending)
 
 
+_FANTASY_KEYWORDS = {
+    "deployment", "rollback", "gitops", "git ops", "xai transparency",
+    "causality map", "causal strength", "causal relationship", "simulation coverage",
+    "validation status", "autonomous healing", "heatmap", "feedback loop status",
+    "deployment health", "rollback status", "instance metric", "application metric",
+    "xai insight", "transparency score", "healing module",
+}
+
+def _is_grounded(text: str) -> bool:
+    lower = text.lower()
+    return not any(kw in lower for kw in _FANTASY_KEYWORDS)
+
+
 def _curate_suggestions(pending: list, cfg: dict) -> list:
     """Brain reviews its own code suggestions for duplicates, overlaps, and conflicts.
     Non-code items (self-model) pass through untouched."""
     code_items  = [item for item in pending if item.get("type") == "code"]
     other_items = [item for item in pending if item.get("type") != "code"]
 
+    # Drop suggestions that reference data this system doesn't have
+    grounded = [item for item in code_items if _is_grounded(item.get("text", ""))]
+    dropped = len(code_items) - len(grounded)
+    if dropped:
+        console.print(f"  [dim]Dropped {dropped} suggestion(s) referencing unavailable data[/dim]")
+    code_items = grounded
+
+    if not code_items:
+        return other_items
     if len(code_items) <= 1:
-        return pending
+        return other_items + code_items
 
     items_text = "\n".join(f"{i+1}. {item['text']}" for i, item in enumerate(code_items))
     prompt = (
@@ -1780,10 +1914,14 @@ def _curate_suggestions(pending: list, cfg: dict) -> list:
         "2. Merge suggestions that address the same feature into one precise suggestion\n"
         "3. Remove or reconcile suggestions that directly conflict\n"
         "4. Reword vague suggestions to be specific and actionable\n"
-        "5. Preserve suggestions that are already distinct and non-overlapping\n\n"
+        "5. Remove any suggestion referencing data unavailable to this system: "
+        "deployment state, GitOps, rollback history, XAI scores, causality maps, "
+        "simulation data — this system only has GPU stats, Qdrant collection counts, "
+        "and self_model fields (mood, color_theme, neural_style, focus_topic, etc.)\n"
+        "6. Preserve suggestions that are distinct, non-overlapping, and buildable\n\n"
         "Return ONLY a JSON array of strings — the consolidated suggestion texts:\n"
         '["suggestion one", "suggestion two"]\n'
-        "Aim for the smallest set that covers all distinct improvements. "
+        "Aim for the smallest set that covers all distinct, feasible improvements. "
         "Return ONLY the JSON array, no explanation, no markdown."
     )
 
@@ -2100,12 +2238,17 @@ def corpus_score():
 
 
 # ── Watch helpers ──────────────────────────────────────────────────────────────
+
+import math
+
+
 NEURAL_CHARS = " .·○◦◉●◦○·."
 WAVE_CHARS   = " ▁▂▃▄▅▆▇█"
-
+_PORTRAIT_FONTS = {"calvin_s", "future", "mini", "digital", "threepoint", "cybersmall", "konto", "straight", "pepper"}
 
 def _neural_field(frame: int, activity: float, style: str = "active",
-                  width: int = 34, height: int = 7) -> str:
+                  width: int = 34, height: int = 7, chars: str = None) -> str:
+    char_set = chars if chars and len(chars) >= 3 else NEURAL_CHARS
     p = NEURAL_STYLES.get(style, NEURAL_STYLES["active"])
     activity = max(p["act_min"], min(1.0, activity))
     ts, sf = p["ts"], p["sf"]
@@ -2117,17 +2260,34 @@ def _neural_field(frame: int, activity: float, style: str = "active",
             w2 = math.sin(frame * ts * 0.7 + x * sf * 0.67 - y * (sf * 1.1) + 1.5)
             combined = (w1 + w2) * 0.5
             scaled = combined * activity + activity * 0.3 + 0.15
-            idx = int(scaled * (len(NEURAL_CHARS) - 1))
-            row.append(NEURAL_CHARS[max(0, min(idx, len(NEURAL_CHARS) - 1))])
+            idx = int(scaled * (len(char_set) - 1))
+            row.append(char_set[max(0, min(idx, len(char_set) - 1))])
         lines.append("".join(row))
     return "\n".join(lines)
 
+def _render_portrait(self_model: dict, width: int = 34) -> str:
+    """Render the brain's self-portrait using pyfiglet for pixel-perfect spacing."""
+    try:
+        import pyfiglet
+        font    = self_model.get("portrait_font", "calvin_s")
+        word    = self_model.get("portrait_word", "ginja")[:10]
+        border  = self_model.get("portrait_border", "◉ · ○ · ◉")
+        tagline = self_model.get("portrait_tagline", "mind · memory")
+        if font not in _PORTRAIT_FONTS:
+            font = "calvin_s"
+        try:
+            art = pyfiglet.figlet_format(word, font=font, width=width).rstrip()
+        except Exception:
+            art = pyfiglet.figlet_format(word, font="calvin_s", width=width).rstrip()
+        art_w = max((len(l) for l in art.splitlines()), default=width)
+        return f"{border[:art_w].center(art_w)}\n{art}\n{tagline[:art_w].center(art_w)}"
+    except Exception:
+        return self_model.get("portrait_border", "◉ · ○ · ◉")
 
 def _waveform(history: list, width: int = 34) -> str:
     h = (history[-width:] if len(history) >= width
          else [0.0] * (width - len(history)) + history)
     return "".join(WAVE_CHARS[min(8, int(v * 8))] for v in h)
-
 
 def _gpu_stats() -> tuple:
     try:
@@ -2142,7 +2302,6 @@ def _gpu_stats() -> tuple:
     except Exception:
         return 0, 0, 4096
 
-
 def _last_thought(cfg: dict) -> str:
     try:
         client = get_qdrant(cfg)
@@ -2155,7 +2314,6 @@ def _last_thought(cfg: dict) -> str:
     except Exception:
         return "—"
 
-
 def _last_evolution() -> str:
     if not EVOLUTION_LOG.exists():
         return "never evolved"
@@ -2164,7 +2322,6 @@ def _last_evolution() -> str:
         if line.startswith("[") and "Evolution cycle" in line:
             return line.strip("[]").replace(" Evolution cycle", "")
     return "never evolved"
-
 
 def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
                         counts, last_thought, last_evo, gpu_history, cfg, self_model):
@@ -2187,11 +2344,25 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
     if _load_suggestions():
         header_text.append("  ✦", style="bold cyan")
 
-    # ── Neural field — brain's chosen style ────────────────────────────────────
-    field = _neural_field(frame, activity, style=style)
+    # ── Self-portrait — brain-authored, pyfiglet-rendered ─────────────────────
+    portrait_str = _render_portrait(self_model)
+    portrait_style = theme["neural"] if activity > 0.15 else f"dim {theme['neural']}"
+
+    # ── Neural field — brain's chosen style and character palette ─────────────
+    neural_chars = self_model.get("neural_chars", NEURAL_CHARS)
+    field = _neural_field(frame, activity, style=style, chars=neural_chars)
     wave  = _waveform(gpu_history)
-    field_style = theme["neural"] if activity > 0.15 else f"dim {theme['neural']}"
-    neural_content = Text(field + "\n\n" + wave, style=field_style)
+    total_collections = len(counts)
+    active_collections = sum(1 for v in counts.values() if v > 0)
+    if total_collections > 0:
+        ratio = active_collections / total_collections
+        bar_len = int(ratio * 40)
+        q_wave = "▶" * bar_len + "·" * (40 - bar_len)
+        wave += f"\n{q_wave} {active_collections}/{total_collections}"
+    field_style = f"dim {theme['neural']}"
+    neural_content = Text()
+    neural_content.append(portrait_str + "\n\n", style=portrait_style)
+    neural_content.append(field + "\n\n" + wave, style=field_style)
 
     # ── Vitals ─────────────────────────────────────────────────────────────────
     gpu_bar  = "█" * int(gpu_pct / 10) + "░" * (10 - int(gpu_pct / 10))
@@ -2203,6 +2374,20 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
     vitals.add_column(style="white")
     vitals.add_row("GPU",   f"[{'green' if gpu_pct < 60 else 'yellow'}]{gpu_bar}[/]  {gpu_pct}%")
     vitals.add_row("VRAM",  f"[{theme['neural']}]{vram_bar}[/]  {vram_used/1024:.1f}/{vram_total/1024:.1f}GB")
+    vitals.add_row("QDRANT", f"{len(counts)} collections  [dim]↗[/dim]")
+    if total_vecs < 1000:
+        q_mem_str = f"{total_vecs} vectors"
+    elif total_vecs < 1_000_000:
+        q_mem_str = f"{total_vecs/1000:.1f}K vectors"
+    else:
+        q_mem_str = f"{total_vecs/1_000_000:.2f}M vectors"
+    vitals.add_row("Q-MEM", q_mem_str)
+    q_capacity = cfg.get("qdrant_vector_capacity", 2_000_000)
+    if q_capacity > 0:
+        q_pct = int(total_vecs / q_capacity * 100)
+        q_bar = "█" * int(q_pct / 10) + "░" * (10 - int(q_pct / 10))
+        q_color = "green" if q_pct < 60 else "yellow" if q_pct < 85 else "red"
+        vitals.add_row("Q-CAP", f"[{q_color}]{q_bar}[/]  {q_pct}%")
     vitals.add_row("", "")
     try:
         import ollama as _ol
@@ -2218,6 +2403,38 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
         bar_len = int(count / max(mem_max, 1) * 8)
         bar = "█" * bar_len + "░" * (8 - bar_len)
         vitals.add_row(name[:8], f"[{theme['mem']}]{bar}[/]  {count}")
+    total_collections = len(counts)
+    total_vectors = sum(counts.values())
+    footer_text = Text()
+    footer_text.append(f"{total_collections} collections  {total_vectors} vectors", style="dim")
+
+    # ── Causality Map — causal relationships as vitals rows ──────────────────
+    causal_rels = self_model.get("causal_relationships", {})
+    if causal_rels:
+        vitals.add_row("", "")
+        vitals.add_row("[dim]CAUSAL[/dim]", "")
+        for key, strength in causal_rels.items():
+            bar_len = int(float(strength) * 8)
+            bar = "█" * bar_len + "░" * (8 - bar_len)
+            vitals.add_row(key[:8], f"[{theme['neural']}]{bar}[/]  {strength:.2f}")
+
+    # ── Feedback Loop — recent feedback entries ───────────────────────────────
+    feedback_history = self_model.get("feedback_history", [])
+    if feedback_history:
+        vitals.add_row("", "")
+        vitals.add_row("[dim]FEEDBACK[/dim]", "")
+        for idx, feedback in enumerate(feedback_history[-3:], 1):
+            vitals.add_row(f"{idx}", f"[{theme['neural']}]{str(feedback)[:28]}[/]")
+
+    # ── GPU Header Panel ───────────────────────────────────────────────────────
+    spark_chars = " ▂▃▄▅▆▇█"
+    sparkline_data = gpu_history[-24:]
+    sparkline = "".join(spark_chars[min(7, int(h * 8))] for h in sparkline_data)
+    gpu_color = "green" if gpu_pct < 60 else "yellow" if gpu_pct < 85 else "red"
+    gpu_panel_text = Text(f"{gpu_pct:>3}% ", style=f"bold {gpu_color}", justify="right")
+    gpu_panel_text.append(sparkline, style=theme["neural"])
+    gpu_header_panel = Panel(Align.center(gpu_panel_text, vertical="middle"),
+                             title="[dim]GPU Load[/dim]", border_style="dim")
 
     recent_entries = _recent_journal(2)
     if recent_entries:
@@ -2264,14 +2481,17 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
         Layout(name="neural", ratio=3),
         Layout(name="vitals", ratio=2),
     )
-    layout["header"].update(Panel(Align.center(header_text), style="bold"))
+    layout["header"].split_row(
+        Layout(name="main_header"),
+        Layout(name="gpu_header", size=32)
+    )
+    layout["main_header"].update(Panel(Align.center(header_text), style="bold"))
+    layout["gpu_header"].update(gpu_header_panel)
     layout["neural"].update(Panel(neural_content, title="[dim]neural field[/dim]",
                                   border_style=theme["neural"]))
     layout["vitals"].update(Panel(vitals, title="[dim]vitals[/dim]", border_style="blue"))
     layout["footer"].update(Panel(footer_text, border_style="dim"))
     return layout
-
-
 @cli.command()
 @click.option("--refresh", "-r", default=4, help="Refresh rate per second (default 4)")
 def watch(refresh):

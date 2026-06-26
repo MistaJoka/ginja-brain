@@ -1,0 +1,62 @@
+[
+  {
+    "name": "Ollama releases",
+    "url": "https://github.com/ollama/ollama/releases.atom",
+    "tags": ["llm", "tools"]
+  },
+  {
+    "name": "Qdrant releases",
+    "url": "https://github.com/qdrant/qdrant/releases.atom",
+    "tags": ["qdrant", "vector-db"]
+  },
+  {
+    "name": "Gitea releases",
+    "url": "https://github.com/go-gitea/gitea/releases.atom",
+    "tags": ["git", "selfhosted"]
+  },
+  {
+    "name": "n8n releases",
+    "url": "https://github.com/n8n-io/n8n/releases.atom",
+    "tags": ["automation", "tools"]
+  },
+  {
+    "name": "Woodpecker CI releases",
+    "url": "https://github.com/woodpecker-ci/woodpecker/releases.atom",
+    "tags": ["ci", "selfhosted"]
+  },
+  {
+    "name": "r/selfhosted",
+    "url": "https://www.reddit.com/r/selfhosted/.rss",
+    "tags": ["selfhosted", "community"]
+  },
+  {
+    "name": "r/homelab",
+    "url": "https://www.reddit.com/r/homelab/.rss",
+    "tags": ["homelab", "community"]
+  },
+  {
+    "name": "r/LocalLLaMA",
+    "url": "https://www.reddit.com/r/LocalLLaMA/.rss",
+    "tags": ["llm", "community"]
+  },
+  {
+    "name": "Hacker News — homelab & selfhosted",
+    "url": "https://hnrss.org/newest?q=homelab+OR+selfhosted&count=15",
+    "tags": ["news"]
+  },
+  {
+    "name": "Hacker News — local LLM",
+    "url": "https://hnrss.org/newest?q=ollama+OR+%22local+llm%22&count=15",
+    "tags": ["llm", "news"]
+  },
+  {
+    "name": "It's FOSS",
+    "url": "https://itsfoss.com/feed/",
+    "tags": ["linux", "foss"]
+  },
+  {
+    "name": "OMG Ubuntu",
+    "url": "https://www.omgubuntu.co.uk/feed",
+    "tags": ["ubuntu", "linux"]
+  }
+]

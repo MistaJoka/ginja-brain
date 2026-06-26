@@ -41,3 +41,19 @@ bin/__pycache__/
 
 # rtl8852bu driver source
 rtl8852bu/
+
+# auto-evolve safety backups
+bin/ginja.bak.*
+bin/ginja.py.bak
+
+# binaries
+bin/trivy
+
+# nested git repos
+homelab/
+
+# sensitive utility scripts
+grant_sudo.sh
+
+# rss runtime state
+.ginja/rss-state.json
