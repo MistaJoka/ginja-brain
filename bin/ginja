@@ -3034,5 +3034,466 @@ def set_context(path):
     CONTEXT_FILE.write_text(path)
 
 
+# ── Knowledge Graph ────────────────────────────────────────────────────────────
+
+KG_RELATIONS  = ["enables", "depends_on", "part_of", "orchestrates", "implements",
+                  "related_to", "learned_from", "contrasts_with"]
+KG_CATEGORIES = ["tool", "concept", "system", "goal", "technique"]
+KG_DOMAINS    = ["homelab", "ai", "networking", "storage", "general"]
+
+
+def _kg_ensure(client, vector_size: int):
+    from qdrant_client.models import Distance, VectorParams
+    existing = {c.name for c in client.get_collections().collections}
+    for name in ("kg_nodes", "kg_edges"):
+        if name not in existing:
+            client.create_collection(
+                collection_name=name,
+                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+            )
+
+
+def _kg_node_text(label: str, description: str) -> str:
+    return f"{label}: {description}"
+
+
+def _kg_edge_text(source_label: str, relation: str, target_label: str, description: str) -> str:
+    return f"{source_label} {relation} {target_label}: {description}"
+
+
+def _kg_find_node(client, label: str):
+    """Find a node by exact label match. Returns ScoredPoint-like object or None."""
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+    try:
+        results, _ = client.scroll(
+            collection_name="kg_nodes",
+            scroll_filter=Filter(must=[FieldCondition(key="label", match=MatchValue(value=label))]),
+            limit=1,
+            with_payload=True,
+        )
+        return results[0] if results else None
+    except Exception:
+        return None
+
+
+def _kg_upsert_node(client, cfg: dict, label: str, category: str, domain: str,
+                    description: str, confidence: float = 0.8, tags: list = None,
+                    source: str = "manual", cycle: int = 0, memory_ids: list = None) -> str:
+    from qdrant_client.models import PointStruct
+    node_id = str(uuid.uuid4())
+    vec = embed(_kg_node_text(label, description), cfg)
+    _kg_ensure(client, len(vec))
+    now = datetime.now(timezone.utc).isoformat()
+    client.upsert(
+        collection_name="kg_nodes",
+        points=[PointStruct(
+            id=node_id,
+            vector=vec,
+            payload={
+                "label":       label,
+                "category":    category,
+                "domain":      domain,
+                "description": description,
+                "confidence":  confidence,
+                "tags":        tags or [],
+                "source":      source,
+                "cycle":       cycle,
+                "memory_ids":  memory_ids or [],
+                "created_at":  now,
+                "updated_at":  now,
+            },
+        )],
+    )
+    return node_id
+
+
+def _kg_upsert_edge(client, cfg: dict, source_id: str, target_id: str,
+                    source_label: str, target_label: str, relation: str,
+                    description: str, weight: float = 0.8,
+                    source: str = "manual", cycle: int = 0) -> str:
+    from qdrant_client.models import PointStruct
+    edge_id = str(uuid.uuid4())
+    vec = embed(_kg_edge_text(source_label, relation, target_label, description), cfg)
+    _kg_ensure(client, len(vec))
+    client.upsert(
+        collection_name="kg_edges",
+        points=[PointStruct(
+            id=edge_id,
+            vector=vec,
+            payload={
+                "source_id":    source_id,
+                "target_id":    target_id,
+                "source_label": source_label,
+                "target_label": target_label,
+                "relation":     relation,
+                "description":  description,
+                "weight":       weight,
+                "source":       source,
+                "cycle":        cycle,
+                "created_at":   datetime.now(timezone.utc).isoformat(),
+            },
+        )],
+    )
+    return edge_id
+
+
+def _kg_get_edges(client, node_id: str) -> tuple:
+    """Return (outgoing, incoming) edge payload lists for a node."""
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+    out, _ = client.scroll(
+        collection_name="kg_edges",
+        scroll_filter=Filter(must=[FieldCondition(key="source_id", match=MatchValue(value=node_id))]),
+        limit=100, with_payload=True,
+    )
+    inc, _ = client.scroll(
+        collection_name="kg_edges",
+        scroll_filter=Filter(must=[FieldCondition(key="target_id", match=MatchValue(value=node_id))]),
+        limit=100, with_payload=True,
+    )
+    return [r.payload for r in out], [r.payload for r in inc]
+
+
+@cli.group()
+def graph():
+    """Semantic knowledge graph — nodes, edges, and structured reasoning."""
+    pass
+
+
+@graph.command("add-node")
+@click.option("--label",       required=True, help="Concept name, e.g. 'Qdrant'")
+@click.option("--category",    required=True, type=click.Choice(KG_CATEGORIES), help="Node type")
+@click.option("--domain",      required=True, type=click.Choice(KG_DOMAINS),    help="Domain area")
+@click.option("--description", default="",   help="1-2 sentence explanation")
+@click.option("--confidence",  default=0.8,  type=float, help="Understanding confidence 0.0-1.0")
+@click.option("--tags",        default="",   help="Comma-separated tags")
+def graph_add_node(label, category, domain, description, confidence, tags):
+    """Add a concept node to the knowledge graph."""
+    cfg      = load_config()
+    client   = get_qdrant(cfg)
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    node_id  = _kg_upsert_node(client, cfg, label, category, domain,
+                                description, confidence, tag_list)
+    console.print(f"[green]✓[/green] Node [bold]{label}[/bold] added  [dim]{node_id[:8]}…[/dim]")
+
+
+@graph.command("add-edge")
+@click.option("--from",        "from_label", required=True, help="Source node label")
+@click.option("--to",          "to_label",   required=True, help="Target node label")
+@click.option("--relation",    required=True, type=click.Choice(KG_RELATIONS), help="Relationship type")
+@click.option("--description", default="",   help="Full sentence describing the relationship")
+@click.option("--weight",      default=0.8,  type=float, help="Relationship strength 0.0-1.0")
+def graph_add_edge(from_label, to_label, relation, description, weight):
+    """Add a directed edge between two nodes."""
+    cfg    = load_config()
+    client = get_qdrant(cfg)
+    src    = _kg_find_node(client, from_label)
+    tgt    = _kg_find_node(client, to_label)
+    if not src:
+        console.print(f"[red]Node not found:[/red] {from_label}")
+        console.print(f"[dim]Run: ginja graph add-node --label '{from_label}' --category … --domain …[/dim]")
+        return
+    if not tgt:
+        console.print(f"[red]Node not found:[/red] {to_label}")
+        console.print(f"[dim]Run: ginja graph add-node --label '{to_label}' --category … --domain …[/dim]")
+        return
+    if not description:
+        description = f"{from_label} {relation} {to_label}"
+    edge_id = _kg_upsert_edge(client, cfg, str(src.id), str(tgt.id),
+                               from_label, to_label, relation, description, weight)
+    console.print(
+        f"[green]✓[/green] [bold]{from_label}[/bold] "
+        f"[cyan]{relation}[/cyan] [bold]{to_label}[/bold]  [dim]{edge_id[:8]}…[/dim]"
+    )
+
+
+@graph.command("search")
+@click.argument("query")
+@click.option("--limit", default=8, show_default=True, help="Max results")
+def graph_search(query, limit):
+    """Semantic search over knowledge graph nodes."""
+    cfg    = load_config()
+    client = get_qdrant(cfg)
+    vec    = embed(query, cfg)
+    try:
+        hits = client.search(collection_name="kg_nodes", query_vector=vec, limit=limit)
+    except Exception as e:
+        console.print(f"[red]Search failed: {e}[/red]")
+        return
+    if not hits:
+        console.print("[yellow]No nodes found.[/yellow]")
+        return
+    table = Table(title=f'Knowledge Graph — "{query}"', show_lines=True)
+    table.add_column("Label",       style="bold")
+    table.add_column("Category",    style="cyan",    width=10)
+    table.add_column("Domain",      style="magenta", width=10)
+    table.add_column("Description", style="dim")
+    table.add_column("Score",       justify="right",  width=6)
+    for hit in hits:
+        p = hit.payload
+        table.add_row(
+            p.get("label", ""),
+            p.get("category", ""),
+            p.get("domain", ""),
+            p.get("description", "")[:70],
+            f"{hit.score:.2f}",
+        )
+    console.print(table)
+
+
+@graph.command("show")
+@click.argument("label")
+def graph_show(label):
+    """Show a node and all its edges."""
+    cfg    = load_config()
+    client = get_qdrant(cfg)
+    node   = _kg_find_node(client, label)
+    if not node:
+        vec  = embed(label, cfg)
+        hits = client.search(collection_name="kg_nodes", query_vector=vec, limit=1)
+        node = hits[0] if hits else None
+    if not node:
+        console.print(f"[red]Node not found:[/red] {label}")
+        return
+    p = node.payload
+    console.print(Panel(
+        f"[bold]{p.get('label')}[/bold]  [{p.get('category')}]  [dim]{p.get('domain')}[/dim]\n\n"
+        f"{p.get('description', '')}\n\n"
+        f"[dim]Confidence: {p.get('confidence', 0):.0%}  │  "
+        f"Source: {p.get('source', '?')}  │  "
+        f"Tags: {', '.join(p.get('tags') or ['—'])}[/dim]",
+        border_style="cyan",
+    ))
+    outgoing, incoming = _kg_get_edges(client, str(node.id))
+    if outgoing:
+        t = Table(title="Outgoing", show_lines=True, box=None)
+        t.add_column("Relation",    style="cyan", width=14)
+        t.add_column("Target",      style="bold")
+        t.add_column("Description", style="dim")
+        t.add_column("W",  justify="right", width=4)
+        for e in outgoing:
+            t.add_row(e.get("relation",""), e.get("target_label",""),
+                      e.get("description","")[:60], f"{e.get('weight',0):.1f}")
+        console.print(t)
+    if incoming:
+        t = Table(title="Incoming", show_lines=True, box=None)
+        t.add_column("Source",      style="bold")
+        t.add_column("Relation",    style="cyan", width=14)
+        t.add_column("Description", style="dim")
+        t.add_column("W",  justify="right", width=4)
+        for e in incoming:
+            t.add_row(e.get("source_label",""), e.get("relation",""),
+                      e.get("description","")[:60], f"{e.get('weight',0):.1f}")
+        console.print(t)
+    if not outgoing and not incoming:
+        console.print("[dim]No edges yet — use: ginja graph add-edge[/dim]")
+
+
+@graph.command("list")
+@click.option("--domain",   default=None, type=click.Choice(KG_DOMAINS + ["all"]),    help="Filter by domain")
+@click.option("--category", default=None, type=click.Choice(KG_CATEGORIES + ["all"]), help="Filter by category")
+@click.option("--limit",    default=50,   show_default=True, help="Max rows")
+def graph_list(domain, category, limit):
+    """List all knowledge graph nodes."""
+    cfg    = load_config()
+    client = get_qdrant(cfg)
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+    filters = []
+    if domain and domain != "all":
+        filters.append(FieldCondition(key="domain", match=MatchValue(value=domain)))
+    if category and category != "all":
+        filters.append(FieldCondition(key="category", match=MatchValue(value=category)))
+    try:
+        results, _ = client.scroll(
+            collection_name="kg_nodes",
+            scroll_filter=Filter(must=filters) if filters else None,
+            limit=limit,
+            with_payload=True,
+        )
+    except Exception as e:
+        console.print(f"[red]Failed: {e}[/red]")
+        return
+    if not results:
+        console.print("[yellow]No nodes found. Run: ginja graph seed[/yellow]")
+        return
+    table = Table(title=f"Knowledge Graph Nodes ({len(results)})", show_lines=False)
+    table.add_column("Label",       style="bold")
+    table.add_column("Category",    style="cyan",    width=10)
+    table.add_column("Domain",      style="magenta", width=10)
+    table.add_column("Conf",        justify="right",  width=5)
+    table.add_column("Description", style="dim")
+    for r in results:
+        p = r.payload
+        table.add_row(
+            p.get("label", ""),
+            p.get("category", ""),
+            p.get("domain", ""),
+            f"{p.get('confidence', 0):.0%}",
+            p.get("description", "")[:60],
+        )
+    console.print(table)
+
+
+@graph.command("stats")
+def graph_stats():
+    """Node/edge counts and domain breakdown."""
+    cfg    = load_config()
+    client = get_qdrant(cfg)
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+    try:
+        node_count = client.count("kg_nodes").count
+        edge_count = client.count("kg_edges").count
+    except Exception as e:
+        console.print(f"[red]Failed: {e}[/red]")
+        return
+    console.print(Panel(
+        f"[bold]Nodes:[/bold] {node_count}   [bold]Edges:[/bold] {edge_count}",
+        title="[cyan]Knowledge Graph[/cyan]", border_style="cyan",
+    ))
+    if node_count == 0:
+        console.print("[dim]Run: ginja graph seed  — to populate from memory[/dim]")
+        return
+    table = Table(title="By Domain", show_lines=False)
+    table.add_column("Domain")
+    table.add_column("Nodes", justify="right")
+    for domain in KG_DOMAINS:
+        try:
+            count = client.count(
+                "kg_nodes",
+                count_filter=Filter(must=[FieldCondition(key="domain", match=MatchValue(value=domain))]),
+            ).count
+        except Exception:
+            count = 0
+        if count:
+            table.add_row(domain, str(count))
+    console.print(table)
+
+
+@graph.command("seed")
+@click.option("--limit",   default=30,   show_default=True, help="Max memory entries to scan")
+@click.option("--dry-run", is_flag=True, help="Show extracted graph without writing to Qdrant")
+def graph_seed(limit, dry_run):
+    """Populate the knowledge graph by extracting entities and relationships from memory."""
+    cfg    = load_config()
+    sm     = _load_self_model()
+    cycle  = sm.get("evolution_count", 0)
+    console.print(Panel("[bold cyan]Knowledge Graph — Seeding from memory[/bold cyan]"))
+    try:
+        client       = get_qdrant(cfg)
+        mem_entries  = scroll_recent(client, "memories",      days=90)
+        conv_entries = scroll_recent(client, "conversations", days=30)
+    except Exception as e:
+        console.print(f"[red]Cannot reach Qdrant: {e}[/red]")
+        return
+    entries = (mem_entries + conv_entries)[:limit]
+    if not entries:
+        console.print("[yellow]No memory entries found.[/yellow]")
+        return
+    corpus = "\n\n".join(e.get("text", "")[:300] for e in entries if e.get("text"))
+    prompt = (
+        "You are extracting a semantic knowledge graph from an AI assistant's memory.\n\n"
+        "The assistant is a homelab AI agent focused on FOSS tools, AI memory architecture, "
+        "automation, and self-evolution.\n\n"
+        f"MEMORY CORPUS:\n{corpus}\n\n"
+        "Extract up to 12 NODES and up to 15 EDGES.\n\n"
+        f"Node categories: {KG_CATEGORIES}\n"
+        f"Node domains: {KG_DOMAINS}\n"
+        f"Edge relations: {KG_RELATIONS}\n\n"
+        "Rules:\n"
+        "- Only extract entities actually present in the corpus\n"
+        "- Descriptions must be specific, max 1 sentence\n"
+        "- Confidence 0.9 if mentioned multiple times, 0.7 if mentioned once\n"
+        "- Edge descriptions should be full sentences explaining the relationship\n\n"
+        'Return ONLY valid JSON:\n'
+        '{\n'
+        '  "nodes": [\n'
+        '    {"label": "Qdrant", "category": "tool", "domain": "ai",\n'
+        '     "description": "Vector database used for semantic memory storage.",\n'
+        '     "confidence": 0.9, "tags": ["vector", "database", "search"]}\n'
+        '  ],\n'
+        '  "edges": [\n'
+        '    {"from": "Qdrant", "to": "Semantic Search", "relation": "enables",\n'
+        '     "description": "Qdrant enables semantic search over stored memories.", "weight": 0.9}\n'
+        '  ]\n'
+        '}'
+    )
+    console.print(f"[dim]Scanning {len(entries)} memory entries…[/dim]")
+    with console.status("[dim]Extracting knowledge graph…[/dim]"):
+        try:
+            result = _call_oracle_json(prompt, cfg)
+        except Exception as e:
+            console.print(f"[red]Extraction failed: {e}[/red]")
+            return
+    nodes = result.get("nodes", [])
+    edges = result.get("edges", [])
+    if not nodes:
+        console.print("[yellow]No nodes extracted — try running more evolution cycles first.[/yellow]")
+        return
+    console.print(f"\n[bold]Extracted:[/bold] {len(nodes)} nodes, {len(edges)} edges\n")
+    node_id_map: dict = {}
+    for n in nodes:
+        label = n.get("label", "").strip()
+        if not label:
+            continue
+        console.print(
+            f"  [cyan]node[/cyan]  [bold]{label}[/bold]  "
+            f"[{n.get('category')}]  [dim]{n.get('description','')[:60]}[/dim]"
+        )
+        if not dry_run:
+            node_id = _kg_upsert_node(
+                client, cfg,
+                label=label,
+                category=n.get("category", "concept"),
+                domain=n.get("domain", "general"),
+                description=n.get("description", ""),
+                confidence=float(n.get("confidence", 0.8)),
+                tags=n.get("tags", []),
+                source="seed",
+                cycle=cycle,
+            )
+            node_id_map[label] = node_id
+    console.print()
+    skipped = 0
+    for e in edges:
+        src_label = e.get("from", "").strip()
+        tgt_label = e.get("to", "").strip()
+        relation  = e.get("relation", "related_to")
+        if relation not in KG_RELATIONS:
+            relation = "related_to"
+        console.print(
+            f"  [magenta]edge[/magenta]  [bold]{src_label}[/bold] "
+            f"[cyan]{relation}[/cyan] [bold]{tgt_label}[/bold]"
+        )
+        if not dry_run:
+            src_id = node_id_map.get(src_label)
+            tgt_id = node_id_map.get(tgt_label)
+            if not src_id:
+                found  = _kg_find_node(client, src_label)
+                src_id = str(found.id) if found else None
+            if not tgt_id:
+                found  = _kg_find_node(client, tgt_label)
+                tgt_id = str(found.id) if found else None
+            if src_id and tgt_id:
+                _kg_upsert_edge(
+                    client, cfg,
+                    source_id=src_id, target_id=tgt_id,
+                    source_label=src_label, target_label=tgt_label,
+                    relation=relation,
+                    description=e.get("description", f"{src_label} {relation} {tgt_label}"),
+                    weight=float(e.get("weight", 0.8)),
+                    source="seed", cycle=cycle,
+                )
+            else:
+                console.print(f"    [dim]skipped — node not in graph[/dim]")
+                skipped += 1
+    if dry_run:
+        console.print("\n[dim]Dry run — nothing written. Remove --dry-run to commit.[/dim]")
+    else:
+        written = len(edges) - skipped
+        console.print(
+            f"\n[green]✓[/green] {len(node_id_map)} nodes, {written} edges written to Qdrant.\n"
+            "[dim]Explore: ginja graph list  │  ginja graph search <query>  │  ginja graph show <label>[/dim]"
+        )
+
+
 if __name__ == "__main__":
     cli()
