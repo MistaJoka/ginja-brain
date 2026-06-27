@@ -4,6 +4,7 @@
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -949,6 +950,20 @@ PERCEPTION_LOG        = GINJA_DIR / "perception.log"
 RUBRIC_FILE           = GINJA_DIR / "rubric.json"
 SELF_EVAL_LOG         = GINJA_DIR / "self-eval.log"
 
+def _parse_duration(s: str) -> int:
+    """Parse '2h', '30m', '1h30m', '90s' into seconds."""
+    import re
+    total = 0
+    for value, unit in re.findall(r'(\d+)([hms])', s.lower()):
+        v = int(value)
+        if unit == 'h':   total += v * 3600
+        elif unit == 'm': total += v * 60
+        elif unit == 's': total += v
+    if total == 0:
+        raise click.BadParameter(f"Cannot parse {s!r}. Use e.g. '2h', '30m', '1h30m'.")
+    return total
+
+
 PHASE_ORDER = ["newborn", "emerging", "developing", "mature"]
 PHASE_THRESHOLDS = [   # descending — first match wins
     (50, "mature"),
@@ -1611,6 +1626,125 @@ def evolve(learn):
         _evolve_learn(current_model, arc, cycle_n, cfg)
     else:
         _evolve_inward(current_model, arc, cycle_n, cfg)
+
+
+@cli.command()
+@click.option("--duration", default=None, help="Max wall-clock time, e.g. 2h, 30m, 1h30m")
+@click.option("--cycles",   default=None, type=int, help="Max number of evolution cycles")
+@click.option("--rest",     default=30,   type=int, show_default=True, help="Seconds to rest between cycles")
+def gym(duration, cycles, rest):
+    """Run evolution in a loop — alternating inward and learn cycles. Ctrl+C to stop cleanly."""
+    cfg = load_config()
+
+    deadline = None
+    if duration:
+        deadline = time.time() + _parse_duration(duration)
+
+    stop_requested = [False]
+
+    def _handle_sigint(sig, frame):
+        stop_requested[0] = True
+        console.print("\n[yellow]Stopping after current cycle…[/yellow]")
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+    start_time  = time.time()
+    cycle_num   = 0
+    inward_count = 0
+    learn_count  = 0
+    start_evo   = None
+
+    limit_str = []
+    if cycles is not None:   limit_str.append(f"{cycles} cycles")
+    if duration is not None: limit_str.append(duration)
+    if not limit_str:        limit_str.append("∞  — Ctrl+C to stop")
+
+    console.print(Panel(
+        f"[bold green]GYM SESSION STARTING[/bold green]\n"
+        f"[dim]Limit: {'  │  '.join(limit_str)}  │  Rest: {rest}s between cycles[/dim]",
+        border_style="green"
+    ))
+
+    while True:
+        if stop_requested[0]:
+            break
+        if cycles is not None and cycle_num >= cycles:
+            break
+        if deadline is not None and time.time() >= deadline:
+            break
+
+        model = _load_self_model()
+        if start_evo is None:
+            start_evo = model.get("evolution_count", 0)
+
+        phase     = model.get("phase", "newborn")
+        can_learn = _phase_index(phase) >= _phase_index("developing")
+        use_learn = (cycle_num % 2 == 1) and can_learn
+        cycle_n   = model.get("evolution_count", 0) + 1
+        arc       = _evolution_arc(10)
+
+        if deadline is not None:
+            rem = max(0, deadline - time.time())
+            h, m = divmod(int(rem), 3600)
+            m, s = divmod(m, 60)
+            time_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+        else:
+            time_str = "∞"
+
+        cycles_disp = f"{cycle_num + 1}/{cycles}" if cycles is not None else f"{cycle_num + 1}/∞"
+        mode_label  = "[bold magenta]LEARN[/bold magenta]" if use_learn else "[bold cyan]INWARD[/bold cyan]"
+
+        console.print(Panel(
+            f"Cycle [bold]{cycles_disp}[/bold]  │  Mode: {mode_label}  │  "
+            f"Evo: [bold]{cycle_n - 1}[/bold]  │  Phase: {phase}  │  Remaining: {time_str}",
+            title="[green]GYM[/green]",
+            border_style="dim green"
+        ))
+
+        try:
+            if use_learn:
+                _evolve_learn(model, arc, cycle_n, cfg)
+                learn_count += 1
+            else:
+                _evolve_inward(model, arc, cycle_n, cfg)
+                inward_count += 1
+        except SystemExit:
+            console.print("[yellow]Cycle skipped — phase gate.[/yellow]")
+        except Exception as exc:
+            console.print(f"[red]Cycle {cycle_num + 1} failed: {exc}[/red]")
+
+        cycle_num += 1
+
+        if stop_requested[0] or (cycles is not None and cycle_num >= cycles) or \
+                (deadline is not None and time.time() >= deadline):
+            break
+
+        if rest > 0:
+            console.print(f"[dim]Resting {rest}s…", end=" ")
+            for _ in range(rest):
+                if stop_requested[0]:
+                    break
+                time.sleep(1)
+            console.print("[/dim]")
+
+    elapsed = int(time.time() - start_time)
+    h, m    = divmod(elapsed, 3600)
+    m, s    = divmod(m, 60)
+    elapsed_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+
+    final_model = _load_self_model()
+    end_evo     = final_model.get("evolution_count", 0)
+    if start_evo is None:
+        start_evo = end_evo
+
+    console.print(Panel(
+        f"[bold]Cycles completed:[/bold] {cycle_num}  ({inward_count} inward, {learn_count} learn)\n"
+        f"[bold]Evolution count:[/bold]  {start_evo} → {end_evo}  (+{end_evo - start_evo})\n"
+        f"[bold]Phase:[/bold]            {final_model.get('phase', '?')}\n"
+        f"[bold]Total time:[/bold]       {elapsed_str}",
+        title="[green]SESSION COMPLETE[/green]",
+        border_style="green"
+    ))
 
 
 @cli.command()
