@@ -972,6 +972,19 @@ PHASE_THRESHOLDS = [   # descending — first match wins
     (0,  "newborn"),
 ]
 
+# Foundational topics the anchor cycles through to prevent goal drift.
+# Each fires every 4 cycles, rotating through this list in order.
+ANCHOR_TOPICS = [
+    "AI memory & retrieval architecture",
+    "self-modeling and introspection techniques",
+    "LLM prompt engineering for self-improvement",
+    "vector search and Qdrant optimization",
+    "code generation and self-modification patterns",
+    "second brain knowledge graph design",
+    "RAG pipeline quality and grounding",
+    "autonomous agent loop design",
+]
+
 DEFAULT_SELF_MODEL = {
     "phase": "newborn",
     "mood": "curious",
@@ -1323,13 +1336,19 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
 
     world_state = _perceive(cfg)
 
-    # Every 4 cycles, break goal drift by re-anchoring to actual usage
-    anchor_note = (
-        "RESET: Your previous focus has drifted from what this system actually does. "
-        "Ignore your last evolution goal entirely. Look at the recent conversations above "
-        "— that is what Andre actually uses you for day-to-day. Ground your new direction "
-        "in those real interactions, not abstract concepts.\n\n"
-    ) if cycle_n % 4 == 0 else ""
+    # Every 4 cycles, force a foundational focus topic to prevent goal drift.
+    # Rotates through ANCHOR_TOPICS so each anchor cycle studies something different.
+    if cycle_n % 4 == 0:
+        anchor_topic = ANCHOR_TOPICS[(cycle_n // 4) % len(ANCHOR_TOPICS)]
+        anchor_note = (
+            f"ANCHOR CYCLE: Your focus has been drifting. Your next_evolution_goal and "
+            f"focus_topic MUST centre on: '{anchor_topic}'. This is a foundational area "
+            f"of your own development as an AI second brain — not Andre's homelab tasks. "
+            f"Study how you can improve your own memory, reasoning, or self-representation "
+            f"in this area. Do not repeat your last evolution goal.\n\n"
+        )
+    else:
+        anchor_note = ""
 
     growth_prompt = (
         f"[WORLD STATE]\n{world_state}\n\n"
@@ -1368,7 +1387,6 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
         "    color change driven by activity level or mood, waveform style variation,\n"
         "    derived ratio metric (e.g. memory:conversation ratio), footer content tweak\n"
         "  Each suggestion must be ONE small change implementable in under 15 lines\n\n"
-        f"{anchor_note}"
         "Reflect on your growth. What have you become? What do you want to become?\n\n"
         "Return ONLY valid JSON with exactly these four keys:\n"
         "{\n"
