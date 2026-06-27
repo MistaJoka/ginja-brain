@@ -944,6 +944,7 @@ def status():
 EVOLUTION_LOG         = GINJA_DIR / "evolution.log"
 SELF_MODEL_FILE       = GINJA_DIR / "self-model.json"
 SUGGESTIONS_FILE      = GINJA_DIR / "suggestions.json"
+SUGGESTION_HISTORY_FILE = GINJA_DIR / "suggestion-history.json"
 VISUAL_APPROVED       = GINJA_DIR / "visual-approved.md"
 CORPUS_MANIFEST       = GINJA_DIR / "corpus-manifest.json"
 PERCEPTION_LOG        = GINJA_DIR / "perception.log"
@@ -1334,6 +1335,20 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
     convo_text = "\n".join(e.get("text", "")[:200] for e in recent_convos[:10]) or "No recent conversations."
     mem_text   = "\n".join(e.get("text", "")[:150] for e in recent_mems[:15]) or "No recent memories."
 
+    recent_history = _load_suggestion_history()[-15:]
+    if recent_history:
+        history_lines = "\n".join(
+            f"  [{h['outcome']}] {h['text'][:80]} (evo #{h['evolution']})"
+            for h in recent_history
+        )
+        history_note = (
+            "Your past suggestions and their outcomes — do NOT repeat rejected ones, "
+            "do NOT re-suggest already implemented ones:\n"
+            f"{history_lines}\n\n"
+        )
+    else:
+        history_note = ""
+
     world_state = _perceive(cfg)
 
     # Every 4 cycles, force a foundational focus topic to prevent goal drift.
@@ -1387,6 +1402,7 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
         "    color change driven by activity level or mood, waveform style variation,\n"
         "    derived ratio metric (e.g. memory:conversation ratio), footer content tweak\n"
         "  Each suggestion must be ONE small change implementable in under 15 lines\n\n"
+        f"{history_note}"
         "Reflect on your growth. What have you become? What do you want to become?\n\n"
         "Return ONLY valid JSON with exactly these four keys:\n"
         "{\n"
@@ -2024,6 +2040,26 @@ def _add_suggestions(items: list):
     _save_suggestions(pending)
 
 
+def _load_suggestion_history() -> list:
+    if not SUGGESTION_HISTORY_FILE.exists():
+        return []
+    return json.loads(SUGGESTION_HISTORY_FILE.read_text()).get("history", [])
+
+
+def _record_suggestion_outcome(item: dict, outcome: str):
+    history = _load_suggestion_history()
+    history.append({
+        "id":         item.get("id", ""),
+        "ts":         item.get("ts", ""),
+        "evolution":  item.get("evolution", "?"),
+        "text":       item.get("text", ""),
+        "type":       item.get("type", ""),
+        "outcome":    outcome,
+        "outcome_ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+    })
+    SUGGESTION_HISTORY_FILE.write_text(json.dumps({"history": history}, indent=2))
+
+
 _FANTASY_KEYWORDS = {
     "deployment", "rollback", "gitops", "git ops", "xai transparency",
     "causality map", "causal strength", "causal relationship", "simulation coverage",
@@ -2212,6 +2248,7 @@ def approve(list_only, no_curate, auto, code_cap):
                             console.print(f"  [green]→[/green] [dim]{field}:[/dim] {str(val)[:60]}")
                     SELF_MODEL_FILE.write_text(json.dumps(current, indent=2))
                     console.print("  [green]✓ Applied[/green]")
+                    _record_suggestion_outcome(item, "approved")
                 else:
                     console.print("  [yellow]No self-model values stored — skipping[/yellow]")
             else:
@@ -2220,12 +2257,15 @@ def approve(list_only, no_curate, auto, code_cap):
                     code_implemented += 1
                     console.print("  [cyan]✓ Implemented · ginja watch updated[/cyan]")
                     approved_code.append(item)
+                    _record_suggestion_outcome(item, "implemented")
                 else:
                     console.print("  [yellow]⚠ Implementation failed — keeping in queue[/yellow]")
+                    _record_suggestion_outcome(item, "failed")
                     remaining = [r for r in remaining if r.get("id") != item.get("id")] + [item]
                     continue
             remaining = [r for r in remaining if r.get("id") != item.get("id")]
         else:
+            _record_suggestion_outcome(item, "rejected")
             if not auto:
                 console.print("  [dim]skipped[/dim]")
 
