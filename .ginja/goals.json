@@ -1,0 +1,20 @@
+{
+  "north_star": {
+    "goal": "Become Andre's reliable AI extension \u2014 proactive, memory-rich, self-improving",
+    "source": "auto",
+    "set_at": "2026-06-27"
+  },
+  "medium": [],
+  "queue": [
+    {
+      "goal": "Design a Qdrant collection backup strategy \u2014 daily snapshot to /mnt/brain/qdrant-backups",
+      "source": "operator",
+      "added_at": "2026-06-27T22:27:37.528550+00:00"
+    },
+    {
+      "goal": "Write a working homelab health alert script that pings docker, disk, and GPU and sends ntfy notification if anything is critical",
+      "source": "operator",
+      "added_at": "2026-06-27T22:27:37.390797+00:00"
+    }
+  ]
+}

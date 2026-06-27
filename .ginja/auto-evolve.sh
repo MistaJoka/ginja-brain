@@ -18,11 +18,16 @@ GINJA_DIR="$HOME/.ginja"
 LOG="$GINJA_DIR/auto-evolve.log"
 LOCKFILE="$GINJA_DIR/auto-evolve.lock"
 BACKUP_DIR="$HOME/bin"
-DURATION_HOURS="${1:-2}"
+DURATION_HOURS="${1:-0}"
 INTERVAL_MIN="${2:-30}"
 MAX_ROLLBACK_STREAK=3
 
-DEADLINE=$(( $(date +%s) + DURATION_HOURS * 3600 ))
+# 0 = run forever; any other value = stop after that many hours
+if [ "${DURATION_HOURS}" = "0" ]; then
+    DEADLINE=9999999999
+else
+    DEADLINE=$(( $(date +%s) + DURATION_HOURS * 3600 ))
+fi
 CYCLE=0
 ROLLBACK_STREAK=0
 
@@ -40,7 +45,8 @@ trap "rm -f '$LOCKFILE'" EXIT INT TERM
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 
-log "=== Auto-evolution started (${DURATION_HOURS}h window, ${INTERVAL_MIN}min interval, code-cap 1) ==="
+WINDOW_DESC="continuous" && [ "${DURATION_HOURS}" != "0" ] && WINDOW_DESC="${DURATION_HOURS}h window"
+log "=== Auto-evolution started (${WINDOW_DESC}, ${INTERVAL_MIN}min interval, code-cap 1) ==="
 
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     CYCLE=$(( CYCLE + 1 ))
@@ -70,6 +76,13 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     if (( CYCLE % 4 == 0 )); then
         log "reflect: storing self-assessment"
         "$GINJA" reflect --store >> "$LOG" 2>&1
+    fi
+
+    # ── Memory consolidation (every 6th cycle — compress episodic → semantic) ──
+    if (( CYCLE % 6 == 0 )); then
+        log "consolidate: compressing episodic perception logs"
+        "$GINJA" consolidate >> "$LOG" 2>&1 \
+            && log "consolidate: done" || log "consolidate: FAILED (non-fatal)"
     fi
 
     # ── Self-eval (every 5th cycle) ───────────────────────────────────────────

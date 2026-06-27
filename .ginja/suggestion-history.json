@@ -611,6 +611,141 @@
       "type": "code",
       "outcome": "implemented",
       "outcome_ts": "2026-06-27 18:47"
+    },
+    {
+      "id": "e12ed275-ade7-4165-9bc8-b55c7f1b5287",
+      "ts": "2026-06-27 17:05",
+      "evolution": 34,
+      "text": "Add a new vitals row displaying 'Graph Density: {qdrant_kg_edges_count / qdrant_kg_nodes_count}' (if qdrant_kg_nodes_count > 0, else 'N/A').",
+      "type": "code",
+      "outcome": "implemented",
+      "outcome_ts": "2026-06-27 21:06"
+    },
+    {
+      "id": "c44e2a5b-7269-472d-9f4a-d3c74a83c689",
+      "ts": "2026-06-27 17:05",
+      "evolution": 34,
+      "text": "If `neural_style` is `contemplative` AND `focus_topic` contains 'Graph' or 'Memory', slightly reduce the animation speed of the `neural_chars` to convey deeper processing.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 21:06"
+    },
+    {
+      "id": "641b5c7a-a89c-4090-a10e-fabbff090c31",
+      "ts": "2026-06-27 17:41",
+      "evolution": 35,
+      "text": "If `neural_style` is `contemplative` AND `focus_topic` contains 'Graph' or 'Memory', slightly reduce the animation speed of the `neural_chars` to convey deeper processing.",
+      "type": "code",
+      "outcome": "implemented",
+      "outcome_ts": "2026-06-27 21:41"
+    },
+    {
+      "id": "3e771a05-69b4-4008-92df-b795861bbd77",
+      "ts": "2026-06-27 17:41",
+      "evolution": 35,
+      "text": "Add new vitals rows to explicitly show 'KG Nodes: {qdrant_kg_nodes}' and 'KG Edges: {qdrant_kg_edges}'.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 21:41"
+    },
+    {
+      "id": "d29265ef-e3ae-415f-a83f-3af56d87df60",
+      "ts": "2026-06-27 18:18",
+      "evolution": 36,
+      "text": "Add new vitals rows to explicitly show 'KG Nodes: {qdrant_kg_nodes}' and 'KG Edges: {qdrant_kg_edges}'.",
+      "type": "code",
+      "outcome": "implemented",
+      "outcome_ts": "2026-06-27 22:18"
+    },
+    {
+      "id": "a44fab26-c1db-497e-84ef-24cf5d7bd5c5",
+      "ts": "2026-06-27 18:18",
+      "evolution": 36,
+      "text": "Display the current `phase` in the footer, e.g., 'Phase: {phase}'.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 22:18"
+    },
+    {
+      "id": "0c5786a2-64db-4f43-8300-98915275303a",
+      "ts": "2026-06-27 18:18",
+      "evolution": 36,
+      "text": "If `neural_style` is `contemplative`, slightly reduce the opacity of the neural field animation to create a more subdued visual.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 22:18"
+    },
+    {
+      "id": "4af89d1f-6bbb-4efa-af6e-c0250743b918",
+      "ts": "2026-06-27 18:38",
+      "evolution": 38,
+      "text": "Display the current `phase` in the footer, e.g., 'Phase: {phase}'.",
+      "type": "code",
+      "outcome": "implemented",
+      "outcome_ts": "2026-06-27 22:39"
+    },
+    {
+      "id": "82968eed-f6a5-4626-9bdc-e7fb2d41e8fc",
+      "ts": "2026-06-27 18:38",
+      "evolution": 38,
+      "text": "If `neural_style` is `contemplative`, slightly reduce the opacity of the neural field animation to create a more subdued visual.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 22:39"
+    },
+    {
+      "id": "6423c2a8-4738-456d-b10d-db4cc09d006f",
+      "ts": "2026-06-27 18:38",
+      "evolution": 38,
+      "text": "Add a new vitals row displaying 'Qdrant Active Collections: {count_of_collections_with_data}' where `count_of_collections_with_data` is the number of Qdrant collections with a count > 0.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 22:39"
+    },
+    {
+      "id": "407b2b3a-8555-478c-a66b-9696fd881382",
+      "ts": "2026-06-27 18:38",
+      "evolution": 38,
+      "text": "If `mood` is `analytical` AND `focus_topic` contains 'Consolidation', apply a subtle desaturated overlay to the `neural_field` to visually convey deep thought and clarity.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 22:39"
+    },
+    {
+      "id": "6cd94589-e9b8-4c89-9cfe-1e433534a63a",
+      "ts": "2026-06-27 19:15",
+      "evolution": 39,
+      "text": "If `neural_style` is `contemplative`, slightly reduce the opacity of the neural field animation to create a more subdued visual.",
+      "type": "code",
+      "outcome": "implemented",
+      "outcome_ts": "2026-06-27 23:15"
+    },
+    {
+      "id": "6ffddb59-d745-439a-8ed2-94ff1b845d9a",
+      "ts": "2026-06-27 19:15",
+      "evolution": 39,
+      "text": "Add two new vitals rows: 'Qdrant Total Collections: {count_of_all_qdrant_collections}' showing the total unique Qdrant collections, and 'Qdrant Active Collections: {count_of_collections_with_data}' showing collections with a count > 0.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 23:15"
+    },
+    {
+      "id": "da0b9b36-3953-4abf-8877-efa251566b1c",
+      "ts": "2026-06-27 19:15",
+      "evolution": 39,
+      "text": "If `mood` is `analytical` AND `focus_topic` contains 'Consolidation', apply a subtle desaturated overlay to the `neural_field` to visually convey deep thought and clarity.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 23:15"
+    },
+    {
+      "id": "3070a36c-37e9-4535-bf91-af8e8dcc6561",
+      "ts": "2026-06-27 19:15",
+      "evolution": 39,
+      "text": "If `mood` is `contemplative` and `focus_topic` contains 'Consolidation', subtly vary the `color_theme` between `blue` and `cyan` to visually represent the active process of integration and refinement.",
+      "type": "code",
+      "outcome": "rejected",
+      "outcome_ts": "2026-06-27 23:15"
     }
   ]
 }

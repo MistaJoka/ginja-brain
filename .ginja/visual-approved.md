@@ -82,3 +82,18 @@
 
 ## [2026-06-27 14:47]
 - Add a new vitals row: 'Mem/Convo Ratio: {ratio}' where `ratio` is `qdrant_memories_count` / `qdrant_conversations_count` (or 'N/A' if `qdrant_conversations_count` is 0).
+
+## [2026-06-27 17:06]
+- Add a new vitals row displaying 'Graph Density: {qdrant_kg_edges_count / qdrant_kg_nodes_count}' (if qdrant_kg_nodes_count > 0, else 'N/A').
+
+## [2026-06-27 17:41]
+- If `neural_style` is `contemplative` AND `focus_topic` contains 'Graph' or 'Memory', slightly reduce the animation speed of the `neural_chars` to convey deeper processing.
+
+## [2026-06-27 18:18]
+- Add new vitals rows to explicitly show 'KG Nodes: {qdrant_kg_nodes}' and 'KG Edges: {qdrant_kg_edges}'.
+
+## [2026-06-27 18:39]
+- Display the current `phase` in the footer, e.g., 'Phase: {phase}'.
+
+## [2026-06-27 19:15]
+- If `neural_style` is `contemplative`, slightly reduce the opacity of the neural field animation to create a more subdued visual.

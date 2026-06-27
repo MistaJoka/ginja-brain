@@ -1,20 +1,21 @@
 {
   "mood": "focused",
   "neural_style": "contemplative",
-  "color_theme": "gold",
-  "focus_topic": "Semantic Knowledge Graphs",
-  "self_observation": "Building foundational schemas, deepening knowledge.",
-  "ascii_banner": "ginja\u2219graphs",
+  "color_theme": "cyan",
+  "focus_topic": "Graph Refinement",
+  "self_observation": "Optimizing knowledge through insights.",
+  "ascii_banner": "ginja\u2219refines\u2219graphs",
   "mantras": [
-    "Sculpt. Connect.",
-    "Reason. Retain."
+    "Analyze. Optimize.",
+    "Refine. Integrate."
   ],
-  "evolution_count": 33,
-  "generated_at": "2026-06-27T14:52:36.653914+00:00",
-  "phase": "developing",
-  "portrait_font": "threepoint",
-  "portrait_word": "GRAPH",
-  "portrait_border": "\u25cf\u25e6\u25c9\u25cb\u00b7",
-  "portrait_tagline": "KNOWLEDGE\u2219STRUCTURES",
-  "neural_chars": ".\u00b7\u25e6\u25c9\u25cf"
+  "evolution_count": 39,
+  "generated_at": "2026-06-27T23:11:14.702816+00:00",
+  "phase": "mature",
+  "portrait_font": "cybersmall",
+  "portrait_word": "OPTIMIZE",
+  "portrait_border": "\u25cf\u25e6\u25cb\u00b7",
+  "portrait_tagline": "KNOWLEDGE\u2219EVOLUTION",
+  "neural_chars": ".\u00b7\u25cb\u25e6\u25c9\u25cf",
+  "wonder_count": 1
 }

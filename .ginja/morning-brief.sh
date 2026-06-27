@@ -153,4 +153,19 @@ $BRIEF
 MDEOF
 
 echo "[$(date)] Morning brief written to $TODAY_FILE" >> "$LOG"
+
+# ── 8. Push notification via ntfy (if configured) ──────────────────────────────
+NTFY_TOPIC=$(python3 -c "import json; print(json.load(open('$CFG')).get('ntfy_topic',''))" 2>/dev/null || echo "")
+if [ -n "$NTFY_TOPIC" ]; then
+    BRIEF_SUMMARY=$(head -6 "$TODAY_FILE" | tail -5 | tr '\n' ' ' | sed 's/  */ /g')
+    curl -s \
+        -H "Title: ginja brief — $WEEKDAY" \
+        -H "Priority: low" \
+        -H "Tags: robot" \
+        -d "$BRIEF_SUMMARY" \
+        "https://ntfy.sh/$NTFY_TOPIC" >> "$LOG" 2>&1 \
+        && echo "[$(date)] ntfy push sent to $NTFY_TOPIC" >> "$LOG" \
+        || echo "[$(date)] ntfy push failed" >> "$LOG"
+fi
+
 echo "[$(date)] Morning brief complete" >> "$LOG"
