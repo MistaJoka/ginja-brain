@@ -35,3 +35,15 @@
 
 ## [2026-06-26 11:03]
 - Add a new vitals row for Qdrant collection memory usage percentage
+
+## [2026-06-26 17:08]
+- Add a memory bar to the vitals panel visualizing Qdrant collection growth trends
+
+## [2026-06-26 17:46]
+- Add a new row to the watch display showing the total number of Qdrant collections and documents.
+
+## [2026-06-26 18:25]
+- Change the color theme based on current activity level or mood.
+
+## [2026-06-26 19:07]
+- Display the ratio of Qdrant collection memory to conversation count in VITALS row

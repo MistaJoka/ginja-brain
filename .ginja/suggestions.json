@@ -1,3 +1,12 @@
 {
-  "pending": []
+  "pending": [
+    {
+      "id": "f2a0a8cc-60d6-405c-be14-f51b1defa106",
+      "ts": "2026-06-26 19:06",
+      "evolution": 22,
+      "source": "curate",
+      "type": "code",
+      "text": "Update footer content to include real-time status updates on Qdrant and n8n integrations"
+    }
+  ]
 }

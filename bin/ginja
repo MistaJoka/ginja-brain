@@ -2327,6 +2327,21 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
                         counts, last_thought, last_evo, gpu_history, cfg, self_model):
     activity = gpu_pct / 100.0
     theme    = COLOR_THEMES.get(self_model.get("color_theme", "cyan"), COLOR_THEMES["cyan"])
+
+    mood = self_model.get("mood", "").lower()
+    if 'anxious' in mood or 'stressed' in mood:
+        theme = COLOR_THEMES.get("red", theme)
+    elif 'focused' in mood or 'learning' in mood:
+        theme = COLOR_THEMES.get("yellow", theme)
+    elif 'calm' in mood or 'serene' in mood:
+        theme = COLOR_THEMES.get("blue", theme)
+    elif 'creative' in mood or 'curious' in mood:
+        theme = COLOR_THEMES.get("magenta", theme)
+    elif activity > 0.85:
+        theme = COLOR_THEMES.get("red", theme)
+    elif activity < 0.15:
+        theme = COLOR_THEMES.get("blue", theme)
+
     style    = self_model.get("neural_style", "active")
     mantras  = self_model.get("mantras", ["Learn. Adapt. Evolve."])
     mantra   = mantras[frame // 40 % len(mantras)] if mantras else ""
@@ -2374,7 +2389,7 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
     vitals.add_column(style="white")
     vitals.add_row("GPU",   f"[{'green' if gpu_pct < 60 else 'yellow'}]{gpu_bar}[/]  {gpu_pct}%")
     vitals.add_row("VRAM",  f"[{theme['neural']}]{vram_bar}[/]  {vram_used/1024:.1f}/{vram_total/1024:.1f}GB")
-    vitals.add_row("QDRANT", f"{len(counts)} collections  [dim]↗[/dim]")
+    vitals.add_row("QDRANT", f"{len(counts)} collections, {total_vecs} documents")
     if total_vecs < 1000:
         q_mem_str = f"{total_vecs} vectors"
     elif total_vecs < 1_000_000:
@@ -2388,6 +2403,29 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
         q_bar = "█" * int(q_pct / 10) + "░" * (10 - int(q_pct / 10))
         q_color = "green" if q_pct < 60 else "yellow" if q_pct < 85 else "red"
         vitals.add_row("Q-CAP", f"[{q_color}]{q_bar}[/]  {q_pct}%")
+    if total_vecs > 0:
+        bar_width = 10
+        bar_str = ""
+        bar_colors = [theme['mem'], theme['neural'], theme['header'], "cyan", "magenta", "yellow"]
+        sorted_collections = sorted(counts.items())
+        last_pos = 0
+        cumulative_count = 0
+        for i, (name, count) in enumerate(sorted_collections):
+            cumulative_count += count
+            current_pos = round(cumulative_count * bar_width / total_vecs)
+            segment_len = current_pos - last_pos
+            if segment_len > 0:
+                color = bar_colors[i % len(bar_colors)]
+                bar_str += f"[{color}]" + "█" * segment_len + "[/]"
+            last_pos = current_pos
+        current_len = bar_str.count('█')
+        if current_len < bar_width:
+            bar_str += '░' * (bar_width - current_len)
+        vitals.add_row("Q-COMP", f"{bar_str}  [dim]composition[/]")
+    conversation_count = counts.get("conversations", 0)
+    if conversation_count > 0:
+        ratio = total_vecs / conversation_count
+        vitals.add_row("Q-RATIO", f"{ratio:.1f} vecs/convo")
     vitals.add_row("", "")
     try:
         import ollama as _ol

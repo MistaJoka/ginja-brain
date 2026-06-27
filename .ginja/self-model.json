@@ -1,20 +1,20 @@
 {
   "mood": "focused",
-  "neural_style": "contemplative",
-  "color_theme": "cyan",
-  "focus_topic": "Qdrant+n8n integrations",
-  "self_observation": "Crafting seamless tool synergies.",
-  "ascii_banner": "ginja \u00b7 integrating \u00b7 minds",
+  "neural_style": "active",
+  "color_theme": "green",
+  "focus_topic": "Qdrant+n8n widgets",
+  "self_observation": "Optimizing homelab with FOSS.",
+  "ascii_banner": "ginja\u25e6integrates\u25e6minds",
   "mantras": [
-    "Innovate. Automate.",
-    "Reflect. Adapt."
+    "Sync. Automate.",
+    "Monitor. Adapt."
   ],
-  "evolution_count": 18,
-  "generated_at": "2026-06-26T14:54:47.781285+00:00",
+  "evolution_count": 22,
+  "generated_at": "2026-06-26T22:58:00.431964+00:00",
   "phase": "developing",
-  "portrait_font": "cybersmall",
+  "portrait_font": "calvin_s",
   "portrait_word": "ginja",
-  "portrait_border": "\u25cf\u25e6\u25e6\u25cb\u25cb\u25cf",
-  "portrait_tagline": "integration \u00b7 synergy",
-  "neural_chars": ".\u00b7\u25cb\u25e6\u25c9"
+  "portrait_border": "\u25cb\u25e6\u25e6\u25cb\u25e6\u25c9",
+  "portrait_tagline": "dashboard \u00b7 synergy",
+  "neural_chars": ".\u00b7\u25cb\u25e6\u25c9\u25cf"
 }
