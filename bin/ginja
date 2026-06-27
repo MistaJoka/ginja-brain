@@ -945,6 +945,7 @@ EVOLUTION_LOG         = GINJA_DIR / "evolution.log"
 SELF_MODEL_FILE       = GINJA_DIR / "self-model.json"
 SUGGESTIONS_FILE      = GINJA_DIR / "suggestions.json"
 SUGGESTION_HISTORY_FILE = GINJA_DIR / "suggestion-history.json"
+LEARNING_HISTORY_FILE   = GINJA_DIR / "learning-history.json"
 VISUAL_APPROVED       = GINJA_DIR / "visual-approved.md"
 CORPUS_MANIFEST       = GINJA_DIR / "corpus-manifest.json"
 PERCEPTION_LOG        = GINJA_DIR / "perception.log"
@@ -1515,26 +1516,58 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
         f"[bold cyan]ginja evolve --learn[/bold cyan] — looking outward  [dim](cycle #{cycle_n})[/dim]"
     ))
 
+    # 1. Anchor override — every 4 cycles, force a foundational topic
     focus_topic = current_model.get("focus_topic", "AI memory and retrieval")
-    console.print(f"[dim]Scanning for growth — focus: {focus_topic[:60]}…[/dim]")
+    is_anchor   = cycle_n % 4 == 0
+    if is_anchor:
+        focus_topic = ANCHOR_TOPICS[(cycle_n // 4) % len(ANCHOR_TOPICS)]
+        console.print(f"[dim]Anchor cycle — foundational topic: {focus_topic}[/dim]")
+    else:
+        console.print(f"[dim]Scanning for growth — focus: {focus_topic[:60]}…[/dim]")
 
-    recent_convos, recent_mems = [], []
+    # 2. Recent conversations (time-based — useful for knowing what Andre needs)
+    recent_convos = []
     try:
         _qdrant = get_qdrant(cfg)
         recent_convos = scroll_recent(_qdrant, "conversations", days=7)
-        recent_mems   = scroll_recent(_qdrant, "memories", days=14)
     except Exception:
         pass
     convo_text = "\n".join(e.get("text", "")[:200] for e in recent_convos[:10]) or "No recent conversations."
-    mem_text   = "\n".join(e.get("text", "")[:150] for e in recent_mems[:15]) or "No recent memories."
+
+    # 3. Semantic recall — what does ginja already know about this specific topic?
+    known_mems = []
+    try:
+        known_mems = search_memory(focus_topic, cfg, top_k=8)
+    except Exception:
+        pass
+    known_text = "\n".join(
+        f"  [{h['collection']}] {h['text'][:150]}"
+        for h in known_mems
+    ) or "Nothing stored yet on this topic."
+
+    # 4. Learning history — what topics have already been researched?
+    learn_history = _load_learning_history()[-10:]
+    if learn_history:
+        history_lines = "\n".join(
+            f"  [cycle #{h['cycle']}] Topic: {h['topic']} → Techniques: {', '.join(h['techniques'][:2])}"
+            for h in learn_history
+        )
+        learn_history_note = (
+            "Topics you have already researched — find COMPLEMENTARY angles, not the same ground:\n"
+            f"{history_lines}\n\n"
+        )
+    else:
+        learn_history_note = ""
 
     world_state = _perceive(cfg)
 
-    web_research = ""
+    # 5. Web research — deeper on anchor cycles
+    web_research  = ""
+    search_depth  = 2 if is_anchor else 1
     if cfg.get("searxng_url"):
-        console.print(f"[dim]Searching web for: {focus_topic[:50]}…[/dim]")
+        console.print(f"[dim]Searching web (depth={search_depth}) for: {focus_topic[:50]}…[/dim]")
         try:
-            web_research = research_topic(focus_topic, cfg, depth=1, pages=3)
+            web_research = research_topic(focus_topic, cfg, depth=search_depth, pages=3)
         except Exception:
             pass
 
@@ -1560,6 +1593,7 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
     learn_prompt = (
         f"[WORLD STATE]\n{world_state}\n\n"
         f"You are ginja-brain. Your current focus is: {focus_topic}\n\n"
+        f"{learn_history_note}"
         "Based on your focus topic, the web research below, and what Andre has been asking you, find:\n"
         f"(1) A specific technique directly advancing '{focus_topic}' you can apply now,\n"
         "(2) A learning or memory strategy to retain knowledge about this topic better,\n"
@@ -1568,7 +1602,7 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
         f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Your evolution history:\n{arc}\n\n"
         f"Recent conversations with Andre:\n{convo_text}\n\n"
-        f"What I already know:\n{mem_text}"
+        f"What I already know about '{focus_topic}' (from memory):\n{known_text}"
         f"{manifest_block}\n\n"
         "Return concrete techniques — things to apply immediately, grounded in the research above.\n\n"
         "Return ONLY valid JSON with exactly these keys:\n"
@@ -1636,6 +1670,8 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
             )
         except Exception:
             pass
+
+    _record_learning(cycle_n, focus_topic, techniques, next_goal)
 
     console.print(Panel(f"[bold green]Learning cycle #{cycle_n} complete[/bold green]\n\n{growth_reflection}"))
     if next_goal:
@@ -2058,6 +2094,24 @@ def _record_suggestion_outcome(item: dict, outcome: str):
         "outcome_ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
     })
     SUGGESTION_HISTORY_FILE.write_text(json.dumps({"history": history}, indent=2))
+
+
+def _load_learning_history() -> list:
+    if not LEARNING_HISTORY_FILE.exists():
+        return []
+    return json.loads(LEARNING_HISTORY_FILE.read_text()).get("history", [])
+
+
+def _record_learning(cycle_n: int, topic: str, techniques: list, next_goal: str):
+    history = _load_learning_history()
+    history.append({
+        "cycle":      cycle_n,
+        "ts":         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        "topic":      topic,
+        "techniques": [t.get("technique", "") for t in techniques[:3]],
+        "next_goal":  next_goal,
+    })
+    LEARNING_HISTORY_FILE.write_text(json.dumps({"history": history}, indent=2))
 
 
 _FANTASY_KEYWORDS = {
