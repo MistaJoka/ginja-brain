@@ -946,6 +946,7 @@ SELF_MODEL_FILE       = GINJA_DIR / "self-model.json"
 SUGGESTIONS_FILE      = GINJA_DIR / "suggestions.json"
 SUGGESTION_HISTORY_FILE = GINJA_DIR / "suggestion-history.json"
 LEARNING_HISTORY_FILE   = GINJA_DIR / "learning-history.json"
+GYM_SESSIONS_FILE       = GINJA_DIR / "gym-sessions.json"
 VISUAL_APPROVED       = GINJA_DIR / "visual-approved.md"
 CORPUS_MANIFEST       = GINJA_DIR / "corpus-manifest.json"
 PERCEPTION_LOG        = GINJA_DIR / "perception.log"
@@ -1702,8 +1703,11 @@ def evolve(learn):
 @click.option("--duration", default=None, help="Max wall-clock time, e.g. 2h, 30m, 1h30m")
 @click.option("--cycles",   default=None, type=int, help="Max number of evolution cycles")
 @click.option("--rest",     default=30,   type=int, show_default=True, help="Seconds to rest between cycles")
-def gym(duration, cycles, rest):
-    """Run evolution in a loop — alternating inward and learn cycles. Ctrl+C to stop cleanly."""
+@click.option("--mode",     default="alternate", show_default=True,
+              type=click.Choice(["alternate", "inward", "learn"]),
+              help="Cycle mode: alternate inward/learn, inward only, or learn only")
+def gym(duration, cycles, rest, mode):
+    """Run evolution in a loop. Ctrl+C stops cleanly after the current cycle."""
     cfg = load_config()
 
     deadline = None
@@ -1718,11 +1722,12 @@ def gym(duration, cycles, rest):
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    start_time  = time.time()
-    cycle_num   = 0
+    start_time   = time.time()
+    cycle_num    = 0
     inward_count = 0
     learn_count  = 0
-    start_evo   = None
+    start_evo    = None
+    start_phase  = None
 
     limit_str = []
     if cycles is not None:   limit_str.append(f"{cycles} cycles")
@@ -1731,9 +1736,11 @@ def gym(duration, cycles, rest):
 
     console.print(Panel(
         f"[bold green]GYM SESSION STARTING[/bold green]\n"
-        f"[dim]Limit: {'  │  '.join(limit_str)}  │  Rest: {rest}s between cycles[/dim]",
+        f"[dim]Mode: {mode}  │  Limit: {'  │  '.join(limit_str)}  │  Rest: {rest}s[/dim]",
         border_style="green"
     ))
+
+    model_after = None
 
     while True:
         if stop_requested[0]:
@@ -1745,13 +1752,21 @@ def gym(duration, cycles, rest):
 
         model = _load_self_model()
         if start_evo is None:
-            start_evo = model.get("evolution_count", 0)
+            start_evo   = model.get("evolution_count", 0)
+            start_phase = model.get("phase", "newborn")
 
         phase     = model.get("phase", "newborn")
         can_learn = _phase_index(phase) >= _phase_index("developing")
-        use_learn = (cycle_num % 2 == 1) and can_learn
-        cycle_n   = model.get("evolution_count", 0) + 1
-        arc       = _evolution_arc(10)
+
+        if mode == "inward":
+            use_learn = False
+        elif mode == "learn":
+            use_learn = can_learn
+        else:
+            use_learn = (cycle_num % 2 == 1) and can_learn
+
+        cycle_n = model.get("evolution_count", 0) + 1
+        arc     = _evolution_arc(10)
 
         if deadline is not None:
             rem = max(0, deadline - time.time())
@@ -1771,6 +1786,7 @@ def gym(duration, cycles, rest):
             border_style="dim green"
         ))
 
+        phase_before = model.get("phase", "newborn")
         try:
             if use_learn:
                 _evolve_learn(model, arc, cycle_n, cfg)
@@ -1783,18 +1799,44 @@ def gym(duration, cycles, rest):
         except Exception as exc:
             console.print(f"[red]Cycle {cycle_num + 1} failed: {exc}[/red]")
 
+        # Phase milestone detection
+        model_after = _load_self_model()
+        phase_after = model_after.get("phase", "newborn")
+        if _phase_index(phase_after) > _phase_index(phase_before):
+            console.print(Panel(
+                f"[bold yellow]PHASE UP[/bold yellow]  {phase_before} → [bold]{phase_after}[/bold]\n"
+                f"[dim]Evolution #{model_after.get('evolution_count', '?')} — new capabilities unlocked[/dim]",
+                border_style="yellow"
+            ))
+
         cycle_num += 1
 
         if stop_requested[0] or (cycles is not None and cycle_num >= cycles) or \
                 (deadline is not None and time.time() >= deadline):
             break
 
+        # Live rest countdown
         if rest > 0:
-            console.print(f"[dim]Resting {rest}s…[/dim]")
-            for _ in range(rest):
-                if stop_requested[0]:
-                    break
-                time.sleep(1)
+            # Determine next cycle's mode for the display
+            if mode == "inward":
+                next_use_learn = False
+            elif mode == "learn":
+                next_use_learn = can_learn
+            else:
+                next_use_learn = (cycle_num % 2 == 1) and can_learn
+            next_label = "LEARN" if next_use_learn else "INWARD"
+            next_color = "magenta" if next_use_learn else "cyan"
+            current_evo = model_after.get("evolution_count", cycle_n) if model_after else cycle_n
+            with Live(console=console, refresh_per_second=2) as live:
+                for remaining in range(rest, 0, -1):
+                    if stop_requested[0]:
+                        break
+                    live.update(Panel(
+                        f"[dim]Resting {remaining}s  │  Next: "
+                        f"[{next_color}]{next_label}[/]  │  Evo: {current_evo}[/dim]",
+                        border_style="dim green"
+                    ))
+                    time.sleep(1)
 
     elapsed = int(time.time() - start_time)
     h, m    = divmod(elapsed, 3600)
@@ -1805,6 +1847,20 @@ def gym(duration, cycles, rest):
     end_evo     = final_model.get("evolution_count", 0)
     if start_evo is None:
         start_evo = end_evo
+
+    _record_gym_session({
+        "start_ts":    datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M"),
+        "end_ts":      datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "mode":        mode,
+        "cycles":      cycle_num,
+        "inward":      inward_count,
+        "learn":       learn_count,
+        "evo_start":   start_evo,
+        "evo_end":     end_evo,
+        "phase_start": start_phase or "?",
+        "phase_end":   final_model.get("phase", "?"),
+        "elapsed_secs": elapsed,
+    })
 
     console.print(Panel(
         f"[bold]Cycles completed:[/bold] {cycle_num}  ({inward_count} inward, {learn_count} learn)\n"
@@ -2112,6 +2168,18 @@ def _record_learning(cycle_n: int, topic: str, techniques: list, next_goal: str)
         "next_goal":  next_goal,
     })
     LEARNING_HISTORY_FILE.write_text(json.dumps({"history": history}, indent=2))
+
+
+def _load_gym_sessions() -> list:
+    if not GYM_SESSIONS_FILE.exists():
+        return []
+    return json.loads(GYM_SESSIONS_FILE.read_text()).get("sessions", [])
+
+
+def _record_gym_session(session: dict):
+    sessions = _load_gym_sessions()
+    sessions.append(session)
+    GYM_SESSIONS_FILE.write_text(json.dumps({"sessions": sessions}, indent=2))
 
 
 _FANTASY_KEYWORDS = {
