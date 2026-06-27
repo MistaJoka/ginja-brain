@@ -1720,12 +1720,11 @@ def gym(duration, cycles, rest):
             break
 
         if rest > 0:
-            console.print(f"[dim]Resting {rest}s…", end=" ")
+            console.print(f"[dim]Resting {rest}s…[/dim]")
             for _ in range(rest):
                 if stop_requested[0]:
                     break
                 time.sleep(1)
-            console.print("[/dim]")
 
     elapsed = int(time.time() - start_time)
     h, m    = divmod(elapsed, 3600)
