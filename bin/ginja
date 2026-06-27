@@ -2656,6 +2656,27 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
         theme = COLOR_THEMES.get("blue", theme)
 
     style    = self_model.get("neural_style", "active")
+    waveform_data = gpu_history
+
+    # Enhance visual feedback based on 'neural_style'
+    line_width = 1.0
+    if style == 'active':
+        line_width = 1.2
+        if theme == COLOR_THEMES.get("cyan", {}):
+            theme = theme.copy()
+            for key, value in theme.items():
+                if value == "cyan":
+                    theme[key] = "bright_cyan"
+    elif style == 'calm':
+        line_width = 0.8
+    elif style == 'contemplative':
+        line_width = 0.9
+        if len(gpu_history) > 2:
+            smoothed = list(gpu_history)
+            for i in range(1, len(gpu_history) - 1):
+                smoothed[i] = (gpu_history[i-1] + gpu_history[i] + gpu_history[i+1]) / 3
+            waveform_data = smoothed
+
     mantras  = self_model.get("mantras", ["Learn. Adapt. Evolve."])
     mantra   = mantras[frame // 40 % len(mantras)] if mantras else ""
     evo_n    = self_model.get("evolution_count", 0)
@@ -2664,8 +2685,11 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
     total_vecs = sum(counts.values())
     uptime = datetime.now().strftime("%H:%M")
     banner = self_model.get("ascii_banner", "◉ ginja-brain ◉")
+    focus_topic = self_model.get("focus_topic", "")
     header_text = Text()
     header_text.append(f"{banner}", style=f"bold {theme['header']}")
+    if focus_topic:
+        header_text.append(f"  |  FOCUS: {focus_topic.upper()}", style=f"bold {theme['neural']}")
     header_text.append(f"  ·  {uptime}  ·  ", style="dim")
     header_text.append(f"{total_vecs} vectors", style=theme["neural"])
     header_text.append(f"  ·  evolved {evo_n}×", style="dim")
@@ -2673,13 +2697,18 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
         header_text.append("  ✦", style="bold cyan")
 
     # ── Self-portrait — brain-authored, pyfiglet-rendered ─────────────────────
+    conversation_count = counts.get("conversations", 0)
+    if conversation_count > 50:
+        self_model['portrait_tagline'] = 'automating · flows'
+    else:
+        self_model['portrait_tagline'] = 'homelab · synergy'
     portrait_str = _render_portrait(self_model)
     portrait_style = theme["neural"] if activity > 0.15 else f"dim {theme['neural']}"
 
     # ── Neural field — brain's chosen style and character palette ─────────────
     neural_chars = self_model.get("neural_chars", NEURAL_CHARS)
     field = _neural_field(frame, activity, style=style, chars=neural_chars)
-    wave  = _waveform(gpu_history)
+    wave  = _waveform(waveform_data)
     total_collections = len(counts)
     active_collections = sum(1 for v in counts.values() if v > 0)
     if total_collections > 0:
@@ -2687,21 +2716,80 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
         bar_len = int(ratio * 40)
         q_wave = "▶" * bar_len + "·" * (40 - bar_len)
         wave += f"\n{q_wave} {active_collections}/{total_collections}"
-    field_style = f"dim {theme['neural']}"
+    
+    field_color = theme['neural']
+    if 'intense' in style or 'chaotic' in style:
+        field_color = 'bright_red'
+    elif 'focused' in style:
+        field_color = 'yellow'
+    elif 'creative' in style:
+        field_color = 'magenta'
+
+    neural_border_style = field_color
+    if style == 'contemplative':
+        # Apply a subtle, slow pulsing animation to symbolize cyclical reflection.
+        pulse_phase = (frame // 20) % 4
+        if pulse_phase == 0:
+            neural_border_style = f"dim {field_color}"
+        elif pulse_phase == 1:
+            neural_border_style = field_color
+        elif pulse_phase == 2:
+            neural_border_style = f"bright_{field_color}"
+        else: # pulse_phase == 3
+            neural_border_style = field_color
+
+    if activity > 0.85:
+        field_style = f"bold {field_color}"
+    elif activity > 0.15:
+        field_style = field_color
+    else:
+        field_style = f"dim {field_color}"
+
     neural_content = Text()
     neural_content.append(portrait_str + "\n\n", style=portrait_style)
     neural_content.append(field + "\n\n" + wave, style=field_style)
 
     # ── Vitals ─────────────────────────────────────────────────────────────────
     gpu_bar  = "█" * int(gpu_pct / 10) + "░" * (10 - int(gpu_pct / 10))
-    vram_pct = int(vram_used / vram_total * 10) if vram_total else 0
-    vram_bar = "█" * vram_pct + "░" * (10 - vram_pct)
+    vram_usage_pct = (vram_used / vram_total * 100) if vram_total else 0
+    vram_bar = "█" * int(vram_usage_pct / 10) + "░" * (10 - int(vram_usage_pct / 10))
+
+    # Determine GPU bar intensity proportionally to usage
+    gpu_base_color = "green" if gpu_pct < 60 else "yellow" if gpu_pct < 85 else "red"
+    if gpu_pct < 20:
+        gpu_style = f"dim {gpu_base_color}"
+    elif gpu_pct < 50:
+        gpu_style = gpu_base_color
+    elif gpu_pct < 80:
+        gpu_style = f"bright_{gpu_base_color}"
+    else:
+        gpu_style = f"bold bright_{gpu_base_color}"
+
+    # Determine VRAM bar intensity proportionally to usage
+    vram_base_color = theme['neural']
+    if vram_usage_pct < 20:
+        vram_style = f"dim {vram_base_color}"
+    elif vram_usage_pct < 50:
+        vram_style = vram_base_color
+    elif vram_usage_pct < 80:
+        vram_style = f"bright_{vram_base_color}"
+    else:
+        vram_style = f"bold bright_{vram_base_color}"
 
     vitals = Table.grid(padding=(0, 1))
     vitals.add_column(style="dim", width=8)
     vitals.add_column(style="white")
-    vitals.add_row("GPU",   f"[{'green' if gpu_pct < 60 else 'yellow'}]{gpu_bar}[/]  {gpu_pct}%")
-    vitals.add_row("VRAM",  f"[{theme['neural']}]{vram_bar}[/]  {vram_used/1024:.1f}/{vram_total/1024:.1f}GB")
+    vitals.add_row("GPU",   f"[{gpu_style}]{gpu_bar}[/]  {gpu_pct}%")
+    vitals.add_row("VRAM",  f"[{vram_style}]{vram_bar}[/]  {int(vram_usage_pct)}%  [dim]({vram_used/1024:.1f}/{vram_total/1024:.1f}GB)[/dim]")
+    qdrant_conversations_count = counts.get("conversations", 0)
+    qdrant_memories_count = counts.get("memories", 0)
+    vitals.add_row("Q-DATA", f"Qdrant Data Points: [{theme['neural']}]{qdrant_conversations_count + qdrant_memories_count}[/]")
+    if qdrant_conversations_count > 0:
+        ratio = f"{(qdrant_memories_count / qdrant_conversations_count):.2f}"
+    else:
+        ratio = "N/A"
+    vitals.add_row("MEM/CONVO", ratio)
+    vitals.add_row("Qdrant Docs", f"{sum(counts.values())}")
     vitals.add_row("QDRANT", f"{len(counts)} collections, {total_vecs} documents")
     if total_vecs < 1000:
         q_mem_str = f"{total_vecs} vectors"
@@ -2739,6 +2827,7 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
     if conversation_count > 0:
         ratio = total_vecs / conversation_count
         vitals.add_row("Q-RATIO", f"{ratio:.1f} vecs/convo")
+        vitals.add_row("MEM/CONV", f"{len(counts) / conversation_count:.2f}")
     vitals.add_row("", "")
     try:
         import ollama as _ol
@@ -2820,6 +2909,13 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
     footer_text.append(f"\nPHASE  ", style="dim")
     footer_text.append(phase_str, style=f"bold {theme['header']}")
     footer_text.append(f"  ·  {unlock_str}", style="dim")
+    total_collections = len(counts)
+    total_vectors = sum(counts.values())
+    footer_text.append(f"\nQDRANT ", style="dim")
+    footer_text.append(f"{total_collections} collections", style=f"bold {theme['neural']}")
+    footer_text.append(f"  ·  {total_vectors:,} vectors", style="dim")
+    portrait_font = self_model.get("portrait_font", "default")
+    footer_text.append(f"  ·  Font: {portrait_font}", style="dim")
 
     # ── Assemble ───────────────────────────────────────────────────────────────
     layout = Layout()
@@ -2839,9 +2935,9 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
     layout["main_header"].update(Panel(Align.center(header_text), style="bold"))
     layout["gpu_header"].update(gpu_header_panel)
     layout["neural"].update(Panel(neural_content, title="[dim]neural field[/dim]",
-                                  border_style=theme["neural"]))
+                                  border_style=neural_border_style))
     layout["vitals"].update(Panel(vitals, title="[dim]vitals[/dim]", border_style="blue"))
-    layout["footer"].update(Panel(footer_text, border_style="dim"))
+    layout["footer"].update(Panel(footer_text, subtitle=f"Evo: #{evo_n}", subtitle_align="right", border_style="dim"))
     return layout
 @cli.command()
 @click.option("--refresh", "-r", default=4, help="Refresh rate per second (default 4)")
