@@ -91,4 +91,40 @@ else
     echo "[$(date)] No Gitea token found — save one to ~/.ginja/.gitea-token to enable Gitea ingestion" >> "$LOG"
 fi
 
+# ── Andre-model — infer Andre's current focus from shell + git activity ───────
+ANDRE_MODEL="$HOME/.ginja/andre-model.json"
+RECENT_CMDS=$(tail -n 80 "$HOME/.bash_history" 2>/dev/null \
+    | grep -v "^#" \
+    | grep -v -E "$NOISE_PATTERN" \
+    | grep -v "^$" \
+    | tail -40)
+RECENT_COMMITS=$(find "$HOME" -maxdepth 4 -name ".git" -type d 2>/dev/null \
+    | while read -r gitdir; do
+        git -C "$(dirname "$gitdir")" log --after="2 days ago" --format="%s" 2>/dev/null | head -5
+    done | head -20)
+COMBINED_ACTIVITY="Shell commands:\n$RECENT_CMDS\n\nRecent git commits:\n$RECENT_COMMITS"
+
+if [ -n "$RECENT_CMDS" ] || [ -n "$RECENT_COMMITS" ]; then
+    ANDRE_JSON=$(curl -s "$OLLAMA_URL/api/generate" \
+        -d "{\"model\":\"$FAST_MODEL\",\"prompt\":\"Based on a developer's recent shell commands and git commits, infer their current context. Return ONLY valid JSON with exactly these fields: {\\\"current_project\\\": \\\"main project or area being worked on\\\", \\\"current_focus_area\\\": \\\"specific technical area\\\", \\\"recent_concerns\\\": [\\\"thing 1\\\", \\\"thing 2\\\"], \\\"energy_signal\\\": \\\"active|stressed|routine\\\", \\\"last_asks\\\": []}. Be specific and factual. If unclear, use 'routine' for energy_signal.\n\nActivity:\n$COMBINED_ACTIVITY\",\"stream\":false}" \
+        2>/dev/null | python3 -c "
+import sys, json
+resp = json.load(sys.stdin).get('response', '')
+start = resp.find('{')
+end = resp.rfind('}') + 1
+if start >= 0 and end > start:
+    try:
+        d = json.loads(resp[start:end])
+        d['last_updated'] = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')
+        print(json.dumps(d, indent=2))
+    except Exception:
+        pass
+" 2>/dev/null)
+
+    if [ -n "$ANDRE_JSON" ]; then
+        echo "$ANDRE_JSON" > "$ANDRE_MODEL"
+        echo "[$(date)] ✓ Andre-model updated" >> "$LOG"
+    fi
+fi
+
 echo "[$(date)] Nightly ingest complete" >> "$LOG"

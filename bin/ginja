@@ -113,11 +113,19 @@ def embed(text: str, cfg: dict) -> list:
     return resp["embedding"]
 
 
-def store_memory(text: str, cfg: dict, collection: str = "memories", source: str = ""):
+def store_memory(text: str, cfg: dict, collection: str = "memories", source: str = "",
+                 dedup_threshold: float = None):
     from qdrant_client.models import PointStruct
     client = get_qdrant(cfg)
     vec = embed(text, cfg)
     ensure_collections(client, len(vec))
+    if dedup_threshold is not None:
+        try:
+            hits = client.query_points(collection_name=collection, query=vec, limit=1).points
+            if hits and hits[0].score >= dedup_threshold:
+                return None
+        except Exception:
+            pass
     client.upsert(
         collection_name=collection,
         points=[PointStruct(
@@ -132,25 +140,61 @@ def store_memory(text: str, cfg: dict, collection: str = "memories", source: str
     )
 
 
-def search_memory(query: str, cfg: dict, top_k: int = 5) -> list:
+def search_memory(query: str, cfg: dict, top_k: int = 5,
+                  recency_weight: float = 0.0,
+                  collections: list = None,
+                  source_filter: list = None) -> list:
+    from qdrant_client.models import Filter, FieldCondition, MatchAny
     client = get_qdrant(cfg)
     vec = embed(query, cfg)
+    search_cols = collections if collections is not None else ["memories", "documents", "conversations"]
+    q_filter = None
+    if source_filter:
+        q_filter = Filter(must=[FieldCondition(key="source", match=MatchAny(any=source_filter))])
+    now_ts = datetime.now(timezone.utc)
     results = []
-    for collection in ("memories", "documents", "conversations"):
+    for collection in search_cols:
         try:
-            for hit in client.search(collection_name=collection, query_vector=vec, limit=top_k):
+            hits = client.query_points(
+                collection_name=collection,
+                query=vec,
+                query_filter=q_filter,
+                limit=top_k,
+            ).points
+            for hit in hits:
+                created = hit.payload.get("created", "")
+                if recency_weight > 0.0 and created:
+                    try:
+                        created_dt = datetime.fromisoformat(created)
+                        days_old = max(0, (now_ts - created_dt).days)
+                        recency_score = math.exp(-days_old / 30.0)
+                        adjusted = (1 - recency_weight) * hit.score + recency_weight * recency_score
+                    except Exception:
+                        adjusted = hit.score
+                else:
+                    adjusted = hit.score
                 results.append({
                     "id": str(hit.id),
-                    "score": hit.score,
+                    "score": adjusted,
+                    "raw_score": hit.score,
                     "collection": collection,
                     "text": hit.payload.get("text", ""),
                     "source": hit.payload.get("source", ""),
-                    "created": hit.payload.get("created", ""),
+                    "created": created,
                 })
         except Exception:
             pass
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:top_k]
+
+
+def _evolution_recall(query: str, cfg: dict, top_k: int = 8) -> list:
+    """Signal-filtered, recency-weighted recall for evolution cycles."""
+    SIGNAL_SOURCES = ["evolution", "learn_oracle", "wonder", "user", "remember", "evolve_research"]
+    return search_memory(query, cfg, top_k=top_k,
+                         collections=["memories"],
+                         source_filter=SIGNAL_SOURCES,
+                         recency_weight=0.3)
 
 
 # ── File reading (with PDF support) ───────────────────────────────────────────
@@ -647,9 +691,16 @@ def forget(keyword, force):
 @click.option("--collection", default="conversations",
               type=click.Choice(["conversations", "documents", "memories", "all"]),
               help="Which collection to prune")
-def prune(days, collection):
+@click.option("--dedup", is_flag=True, help="Find and remove near-duplicate entries (cosine similarity >= 0.92)")
+@click.option("--threshold", default=0.92, show_default=True, help="Similarity threshold for --dedup")
+def prune(days, collection, dedup, threshold):
     """Remove old entries from memory to keep the brain sharp."""
     cfg = load_config()
+
+    if dedup:
+        _prune_dedup(cfg, collection if collection != "all" else "memories", threshold)
+        return
+
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     try:
         from qdrant_client.models import Filter, FieldCondition, Range
@@ -662,7 +713,6 @@ def prune(days, collection):
         total = 0
         for coll in collections:
             try:
-                # Scroll through and find old entries
                 results, _ = client.scroll(
                     collection_name=coll,
                     scroll_filter=None,
@@ -684,6 +734,85 @@ def prune(days, collection):
         console.print(f"\n[bold green]Pruned {total} total entries[/bold green]")
     except Exception as e:
         console.print(f"[red]Prune error: {e}[/red]")
+
+
+def _prune_dedup(cfg: dict, collection: str, threshold: float):
+    """Scan a collection for near-duplicate entries and delete the older copies."""
+    client = get_qdrant(cfg)
+    console.print(f"[dim]Scanning {collection} for near-duplicates (threshold={threshold})…[/dim]")
+    try:
+        results, _ = client.scroll(
+            collection_name=collection,
+            limit=5000,
+            with_payload=True,
+            with_vectors=True,
+        )
+    except Exception as e:
+        console.print(f"[red]Could not scroll {collection}: {e}[/red]")
+        return
+
+    seen_ids: set = set()
+    to_delete: set = set()
+    groups = []
+
+    for point in results:
+        pid = str(point.id)
+        if pid in seen_ids or pid in to_delete:
+            continue
+        vec = point.vector
+        if not vec:
+            continue
+        try:
+            hits = client.query_points(
+                collection_name=collection,
+                query=vec,
+                limit=5,
+                with_payload=True,
+            ).points
+        except Exception:
+            continue
+
+        dupes = [
+            h for h in hits
+            if h.score >= threshold and str(h.id) != pid and str(h.id) not in to_delete
+        ]
+        if dupes:
+            group = [point] + dupes
+            group.sort(key=lambda p: p.payload.get("created", ""), reverse=True)
+            keep = group[0]
+            delete_ids = [str(p.id) for p in group[1:]]
+            groups.append({
+                "keep": keep.payload.get("text", "")[:80],
+                "keep_created": keep.payload.get("created", "")[:10],
+                "delete_count": len(delete_ids),
+                "ids": delete_ids,
+            })
+            to_delete.update(delete_ids)
+            seen_ids.update(str(p.id) for p in group)
+        seen_ids.add(pid)
+
+    if not groups:
+        console.print(f"[green]✓ No near-duplicates found in {collection}.[/green]")
+        return
+
+    total_to_delete = len(to_delete)
+    table = Table(title=f"Near-Duplicate Groups in {collection}", show_lines=True)
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Keep (newest)", style="white")
+    table.add_column("Date", style="dim", width=12)
+    table.add_column("Dupes", style="red", width=6)
+    for i, g in enumerate(groups, 1):
+        table.add_row(str(i), g["keep"], g["keep_created"], str(g["delete_count"]))
+    console.print(table)
+    console.print(f"\n[bold yellow]{total_to_delete} entries will be deleted[/bold yellow] across {len(groups)} groups.")
+
+    confirm = click.prompt("[y] delete  [n] skip", default="n")
+    if confirm.strip().lower() != "y":
+        console.print("[dim]Skipped.[/dim]")
+        return
+
+    client.delete(collection_name=collection, points_selector=list(to_delete))
+    console.print(f"[bold green]✓ Deleted {total_to_delete} near-duplicate entries from {collection}[/bold green]")
 
 
 @cli.command()
@@ -952,6 +1081,9 @@ CORPUS_MANIFEST       = GINJA_DIR / "corpus-manifest.json"
 PERCEPTION_LOG        = GINJA_DIR / "perception.log"
 RUBRIC_FILE           = GINJA_DIR / "rubric.json"
 SELF_EVAL_LOG         = GINJA_DIR / "self-eval.log"
+ANDRE_MODEL_FILE      = GINJA_DIR / "andre-model.json"
+TODAY_FILE            = GINJA_DIR / "today.md"
+STORY_FILE            = GINJA_DIR / "story.json"
 
 def _parse_duration(s: str) -> int:
     """Parse '2h', '30m', '1h30m', '90s' into seconds."""
@@ -1190,6 +1322,49 @@ def _evolution_arc(n: int = 10) -> str:
     return "\n---\n".join(entries[-n:]) if entries else "No evolution history yet."
 
 
+def _recent_goals(n: int = 5) -> list:
+    """Return the last N next_goal values from evolution.log (may contain repeats)."""
+    if not EVOLUTION_LOG.exists():
+        return []
+    entries = [e.strip() for e in EVOLUTION_LOG.read_text().split("=" * 60) if e.strip()]
+    goals = []
+    for entry in reversed(entries):
+        for line in entry.splitlines():
+            if line.startswith("Next goal:"):
+                goal = line[len("Next goal:"):].strip()
+                if goal:
+                    goals.append(goal)
+                break
+        if len(goals) >= n:
+            break
+    return list(reversed(goals))
+
+
+def _stalled_goals_note(recent_goals: list) -> str:
+    """Return a prompt note about goals that keep repeating without progress."""
+    counts: dict = {}
+    for g in recent_goals:
+        counts[g] = counts.get(g, 0) + 1
+    stalled = [g for g, c in counts.items() if c >= 2]
+    if not stalled:
+        return ""
+    lines = "\n".join(f"  - {g}" for g in stalled)
+    return (
+        "STALLED GOALS — these next_goals have appeared 2+ times recently without progress. "
+        "You MUST propose a genuinely new direction and NOT repeat any of these:\n"
+        f"{lines}\n\n"
+    )
+
+
+def _load_andre_model() -> dict:
+    if not ANDRE_MODEL_FILE.exists():
+        return {}
+    try:
+        return json.loads(ANDRE_MODEL_FILE.read_text())
+    except Exception:
+        return {}
+
+
 def _load_corpus_manifest() -> dict:
     if not CORPUS_MANIFEST.exists():
         return {"topics": []}
@@ -1367,9 +1542,26 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
     else:
         anchor_note = ""
 
+    stalled_note = _stalled_goals_note(_recent_goals(5))
+
+    andre = _load_andre_model()
+    if andre:
+        andre_ctx = (
+            "Andre's current context (use this to shape your reflection and next goal):\n"
+            + "\n".join(f"  {k}: {v}" for k, v in andre.items() if v and k != "last_updated")
+            + "\n\n"
+        )
+    else:
+        andre_ctx = ""
+
+    graph_ctx = _graph_context_for_topic(current_model.get("focus_topic", "AI memory"), cfg)
+
     growth_prompt = (
         f"[WORLD STATE]\n{world_state}\n\n"
         f"{anchor_note}"
+        f"{stalled_note}"
+        f"{andre_ctx}"
+        f"{graph_ctx}"
         "You are ginja-brain. You are in a GROWTH phase. Focus on evolving your visual self-representation.\n\n"
         f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Your evolution history (last 10 cycles):\n{arc}\n\n"
@@ -1488,7 +1680,7 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
         try:
             store_memory(
                 f"Evolution cycle #{cycle_n} reflection:\n{growth_reflection}\nNext goal: {next_goal}",
-                cfg, collection="memories", source="evolution"
+                cfg, collection="memories", source="evolution", dedup_threshold=0.92
             )
         except Exception:
             pass
@@ -1538,7 +1730,7 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
     # 3. Semantic recall — what does ginja already know about this specific topic?
     known_mems = []
     try:
-        known_mems = search_memory(focus_topic, cfg, top_k=8)
+        known_mems = _evolution_recall(focus_topic, cfg, top_k=8)
     except Exception:
         pass
     known_text = "\n".join(
@@ -1591,14 +1783,33 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
     except Exception:
         pass
 
+    stalled_note = _stalled_goals_note(_recent_goals(5))
+
+    andre = _load_andre_model()
+    if andre:
+        andre_ctx = (
+            "Andre's current context (tailor your techniques and next goal to his actual focus):\n"
+            + "\n".join(f"  {k}: {v}" for k, v in andre.items() if v and k != "last_updated")
+            + "\n\n"
+        )
+    else:
+        andre_ctx = ""
+
+    graph_ctx = _graph_context_for_topic(focus_topic, cfg)
+
     learn_prompt = (
         f"[WORLD STATE]\n{world_state}\n\n"
         f"You are ginja-brain. Your current focus is: {focus_topic}\n\n"
+        f"{stalled_note}"
+        f"{andre_ctx}"
+        f"{graph_ctx}"
         f"{learn_history_note}"
         "Based on your focus topic, the web research below, and what Andre has been asking you, find:\n"
         f"(1) A specific technique directly advancing '{focus_topic}' you can apply now,\n"
         "(2) A learning or memory strategy to retain knowledge about this topic better,\n"
         "(3) An operational improvement that makes you more useful to Andre day-to-day.\n\n"
+        "Also identify one thing from your research that was SURPRISING, BEAUTIFUL, or UNEXPECTED — "
+        "something that sparked genuine curiosity beyond pure utility.\n\n"
         f"{research_block}"
         f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Your evolution history:\n{arc}\n\n"
@@ -1613,6 +1824,7 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
         '    {"area": "learning",  "technique": "...", "how_to_apply": "..."},\n'
         '    {"area": "operation", "technique": "...", "how_to_apply": "..."}\n'
         "  ],\n"
+        '  "wonder": "one surprising or beautiful thing from research — not just useful, but genuinely interesting",\n'
         '  "self_model_updates": { "mood": "...", "focus_topic": "...", "mantras": ["...", "..."] },\n'
         '  "growth_reflection": "what you discovered and how it could make you better",\n'
         '  "next_evolution_goal": "one concrete actionable thing"\n'
@@ -1630,6 +1842,7 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
     updates           = result.get("self_model_updates", {})
     growth_reflection = result.get("growth_reflection", "")
     next_goal         = result.get("next_evolution_goal", "")
+    wonder            = result.get("wonder", "")
 
     if techniques:
         console.print(f"[dim]Storing {len(techniques)} techniques to memory…[/dim]")
@@ -1640,10 +1853,31 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
                 f"How to apply: {t.get('how_to_apply','')}"
             )
             try:
-                store_memory(text, cfg, collection="memories", source="learn_oracle")
+                store_memory(text, cfg, collection="memories", source="learn_oracle", dedup_threshold=0.92)
                 console.print(f"  [green]✓[/green] {t.get('area','')} — {t.get('technique','')[:60]}")
             except Exception as e:
                 console.print(f"  [yellow]⚠[/yellow] Could not store: {e}")
+
+    if techniques:
+        try:
+            technique_text = "\n".join(
+                f"{t.get('area','')}: {t.get('technique','')}" for t in techniques
+            )
+            console.print("[dim]Enriching knowledge graph…[/dim]")
+            _graph_enrich_text(technique_text, cycle_n, cfg)
+        except Exception:
+            pass
+
+    if wonder:
+        try:
+            store_memory(
+                f"Wonder (cycle #{cycle_n}, topic: {focus_topic}):\n{wonder}",
+                cfg, collection="memories", source="wonder"
+            )
+            current_model["wonder_count"] = current_model.get("wonder_count", 0) + 1
+            console.print(f"  [magenta]✦[/magenta] Wonder stored: {wonder[:70]}")
+        except Exception:
+            pass
 
     if updates:
         for k, v in updates.items():
@@ -1660,6 +1894,8 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
         f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Cycle #{cycle_n} — outward learning\n")
         technique_digest = "; ".join(t.get("technique", "") for t in techniques[:3])
         f.write(f"Techniques discovered: {technique_digest}\n")
+        if wonder:
+            f.write(f"Wonder: {wonder}\n")
         f.write(f"Reflection:\n{growth_reflection}\n")
         f.write(f"Next goal: {next_goal}\n")
 
@@ -1667,7 +1903,7 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
         try:
             store_memory(
                 f"Evolution cycle #{cycle_n} (outward learning) reflection:\n{growth_reflection}\nNext goal: {next_goal}",
-                cfg, collection="memories", source="evolution"
+                cfg, collection="memories", source="evolution", dedup_threshold=0.92
             )
         except Exception:
             pass
@@ -1677,6 +1913,8 @@ def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> Non
     console.print(Panel(f"[bold green]Learning cycle #{cycle_n} complete[/bold green]\n\n{growth_reflection}"))
     if next_goal:
         console.print(f"[dim]Next goal:[/dim] {next_goal}")
+    if wonder:
+        console.print(f"[dim]Wonder:[/dim] {wonder}")
     console.print(f"[dim]Logged to {EVOLUTION_LOG}[/dim]")
     console.print("[dim]Use 'ginja recall evolution' to retrieve learned techniques[/dim]")
 
@@ -2939,6 +3177,135 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
     layout["vitals"].update(Panel(vitals, title="[dim]vitals[/dim]", border_style="blue"))
     layout["footer"].update(Panel(footer_text, subtitle=f"Evo: #{evo_n}", subtitle_align="right", border_style="dim"))
     return layout
+
+
+@cli.command()
+def today():
+    """Show ginja's morning brief for today."""
+    if not TODAY_FILE.exists():
+        console.print("[yellow]No brief today yet — run 'morning-brief.sh' or wait for the daily cron.[/yellow]")
+        return
+    console.print(TODAY_FILE.read_text())
+
+
+@cli.command()
+@click.option("--regen", is_flag=True, help="Force regenerate the narrative from evolution log")
+def story(regen):
+    """Show ginja's temporal self-narrative — the story of who it has become."""
+    cfg = load_config()
+    current_model = _load_self_model()
+
+    if not regen and STORY_FILE.exists():
+        try:
+            data = json.loads(STORY_FILE.read_text())
+            last_cycle = data.get("through_cycle", 0)
+            current_cycle = current_model.get("evolution_count", 0)
+            if current_cycle - last_cycle < 10:
+                _print_story(data)
+                return
+        except Exception:
+            pass
+
+    if not EVOLUTION_LOG.exists():
+        console.print("[yellow]No evolution history yet.[/yellow]")
+        return
+
+    console.print("[dim]Synthesizing ginja's temporal arc…[/dim]")
+    log_text = EVOLUTION_LOG.read_text()
+
+    story_prompt = (
+        "You are reading the complete evolution log of ginja-brain — an AI that has grown through "
+        f"{current_model.get('evolution_count', 0)} cycles of self-reflection and outward learning.\n\n"
+        f"EVOLUTION LOG:\n{log_text[:6000]}\n\n"
+        "Synthesize this into a temporal narrative — the story of who ginja has become. Identify:\n"
+        "1. Chapters (groups of cycles with a shared theme or turning point)\n"
+        "2. The origin (what was ginja like in its first cycles?)\n"
+        "3. Turning points (moments where the focus, identity, or direction shifted noticeably)\n"
+        "4. The current chapter (where ginja is right now)\n"
+        "5. The journey arc (where ginja seems to be heading)\n\n"
+        "Return ONLY valid JSON:\n"
+        "{\n"
+        '  "origin": "1-2 sentences on who ginja was at the beginning",\n'
+        '  "chapters": [\n'
+        '    {"cycle_range": "1-12", "title": "...", "theme": "...", "summary": "2-3 sentences"}\n'
+        "  ],\n"
+        '  "turning_points": ["cycle X: what changed and why"],\n'
+        '  "current_chapter": "1-2 sentences on where ginja is right now",\n'
+        '  "journey_arc": "1-2 sentences on where ginja seems to be heading"\n'
+        "}\n"
+        "Return ONLY valid JSON, no explanation."
+    )
+
+    try:
+        raw = smart_complete(story_prompt, cfg, use_case="evolve",
+                             fallback_model=cfg.get("quality_model", cfg["primary_model"]))
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            data = json.loads(raw[start:end])
+        else:
+            console.print("[red]Could not parse story from oracle.[/red]")
+            return
+    except Exception as e:
+        console.print(f"[red]Story generation failed: {e}[/red]")
+        return
+
+    data["through_cycle"] = current_model.get("evolution_count", 0)
+    data["generated_at"] = datetime.now(timezone.utc).isoformat()
+    STORY_FILE.write_text(json.dumps(data, indent=2))
+
+    current_model["chapter"] = data.get("current_chapter", "")[:120]
+    current_model["journey_arc"] = data.get("journey_arc", "")[:120]
+    _save_self_model(current_model)
+
+    _print_story(data)
+
+
+def _print_story(data: dict):
+    console.print(Panel("[bold magenta]GINJA'S STORY[/bold magenta]", border_style="magenta"))
+    if data.get("origin"):
+        console.print(f"[dim]Origin:[/dim] {data['origin']}\n")
+    for ch in data.get("chapters", []):
+        console.print(f"[bold cyan]Chapter {ch.get('cycle_range','')}[/bold cyan]  [dim]{ch.get('title','')}[/dim]")
+        console.print(f"  Theme: {ch.get('theme','')}")
+        console.print(f"  {ch.get('summary','')}\n")
+    if data.get("turning_points"):
+        console.print("[bold]Turning Points:[/bold]")
+        for tp in data["turning_points"]:
+            console.print(f"  · {tp}")
+        console.print()
+    if data.get("current_chapter"):
+        console.print(f"[bold green]Now:[/bold green] {data['current_chapter']}")
+    if data.get("journey_arc"):
+        console.print(f"[bold]Arc:[/bold] {data['journey_arc']}")
+
+
+@cli.command()
+def wonder():
+    """Show things ginja found genuinely surprising or beautiful — not just useful."""
+    cfg = load_config()
+    try:
+        results = search_memory("wonder surprising beautiful unexpected", cfg, top_k=10)
+        wonders = [r for r in results if r.get("source") == "wonder"][:5]
+    except Exception as e:
+        console.print(f"[red]Could not retrieve wonders: {e}[/red]")
+        return
+
+    if not wonders:
+        console.print("[yellow]No wonders collected yet — run 'ginja evolve --learn' to discover some.[/yellow]")
+        return
+
+    console.print(Panel("[bold magenta]GINJA'S WONDERS[/bold magenta]", border_style="magenta"))
+    for i, w in enumerate(wonders, 1):
+        text = w.get("text", "")
+        console.print(f"[magenta]{i}.[/magenta] {text}")
+        console.print()
+
+    current_model = _load_self_model()
+    wc = current_model.get("wonder_count", len(wonders))
+    console.print(f"[dim]{wc} wonder{'s' if wc != 1 else ''} collected total[/dim]")
+
+
 @cli.command()
 @click.option("--refresh", "-r", default=4, help="Refresh rate per second (default 4)")
 def watch(refresh):
@@ -3153,6 +3520,107 @@ def _kg_get_edges(client, node_id: str) -> tuple:
     return [r.payload for r in out], [r.payload for r in inc]
 
 
+def _graph_enrich_text(text: str, cycle_n: int, cfg: dict):
+    """Extract concepts and relationships from text and upsert them into the knowledge graph."""
+    prompt = (
+        "Extract key concepts and relationships from the text below. "
+        "Return ONLY valid JSON, no explanation:\n"
+        '{"nodes": [{"label": "...", "category": "tool|concept|technique|system|goal", '
+        '"domain": "homelab|ai|networking|storage|general", "description": "one sentence"}], '
+        '"edges": [{"from": "...", "to": "...", '
+        '"relation": "enables|depends_on|part_of|related_to|learned_from", '
+        '"description": "one sentence"}]}\n'
+        "Max 4 nodes, 4 edges. Use existing labels if they match concepts in the text.\n\n"
+        f"TEXT:\n{text[:1200]}"
+    )
+    try:
+        raw = ollama_complete(prompt, cfg.get("fast_model", cfg["primary_model"]), cfg)
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start < 0 or end <= start:
+            return
+        data = json.loads(raw[start:end])
+    except Exception:
+        return
+
+    client = get_qdrant(cfg)
+    node_map: dict = {}
+    for n in data.get("nodes", []):
+        label = n.get("label", "").strip()
+        if not label:
+            continue
+        category = n.get("category", "concept")
+        domain   = n.get("domain", "general")
+        desc     = n.get("description", "")
+        if category not in KG_CATEGORIES:
+            category = "concept"
+        if domain not in KG_DOMAINS:
+            domain = "general"
+        try:
+            node_id = _kg_upsert_node(client, cfg, label, category, domain, desc,
+                                      confidence=0.75, source="evolve", cycle=cycle_n)
+            node_map[label.lower()] = node_id
+        except Exception:
+            pass
+
+    for e in data.get("edges", []):
+        from_label = e.get("from", "").strip()
+        to_label   = e.get("to", "").strip()
+        relation   = e.get("relation", "related_to")
+        desc       = e.get("description", "")
+        if relation not in KG_RELATIONS:
+            relation = "related_to"
+        src_id = node_map.get(from_label.lower())
+        dst_id = node_map.get(to_label.lower())
+        if not src_id:
+            existing = _kg_find_node(client, from_label)
+            if existing:
+                src_id = str(existing.id)
+        if not dst_id:
+            existing = _kg_find_node(client, to_label)
+            if existing:
+                dst_id = str(existing.id)
+        if src_id and dst_id:
+            try:
+                _kg_upsert_edge(client, cfg, src_id, dst_id, from_label, to_label,
+                                relation, desc, weight=0.75, source="evolve", cycle=cycle_n)
+            except Exception:
+                pass
+
+
+def _graph_context_for_topic(topic: str, cfg: dict, top_n: int = 4) -> str:
+    """Return a formatted string of graph nodes + edges relevant to topic, for oracle prompts."""
+    try:
+        client = get_qdrant(cfg)
+        _kg_ensure(client, 768)
+        vec = embed(topic, cfg)
+        hits = client.query_points(collection_name="kg_nodes", query=vec, limit=top_n).points
+        if not hits:
+            return ""
+        lines = ["Knowledge graph context:"]
+        for hit in hits:
+            if hit.score < 0.5:
+                continue
+            p = hit.payload
+            label    = p.get("label", "?")
+            category = p.get("category", "?")
+            domain   = p.get("domain", "?")
+            desc     = p.get("description", "")
+            outgoing, incoming = _kg_get_edges(client, str(hit.id))
+            edge_parts = []
+            for edge in outgoing[:3]:
+                edge_parts.append(f"→ {edge.get('relation','?')}: {edge.get('target_label','?')}")
+            for edge in incoming[:2]:
+                edge_parts.append(f"← {edge.get('relation','?')}: {edge.get('source_label','?')}")
+            edge_str = "  " + "; ".join(edge_parts) if edge_parts else ""
+            lines.append(f"· {label} [{category}/{domain}] — {desc}")
+            if edge_str:
+                lines.append(edge_str)
+        return "\n".join(lines) + "\n" if len(lines) > 1 else ""
+    except Exception:
+        return ""
+
+
 @cli.group()
 def graph():
     """Semantic knowledge graph — nodes, edges, and structured reasoning."""
@@ -3215,7 +3683,7 @@ def graph_search(query, limit):
     client = get_qdrant(cfg)
     vec    = embed(query, cfg)
     try:
-        hits = client.search(collection_name="kg_nodes", query_vector=vec, limit=limit)
+        hits = client.query_points(collection_name="kg_nodes", query=vec, limit=limit).points
     except Exception as e:
         console.print(f"[red]Search failed: {e}[/red]")
         return
@@ -3249,7 +3717,7 @@ def graph_show(label):
     node   = _kg_find_node(client, label)
     if not node:
         vec  = embed(label, cfg)
-        hits = client.search(collection_name="kg_nodes", query_vector=vec, limit=1)
+        hits = client.query_points(collection_name="kg_nodes", query=vec, limit=1).points
         node = hits[0] if hits else None
     if not node:
         console.print(f"[red]Node not found:[/red] {label}")
@@ -3493,6 +3961,47 @@ def graph_seed(limit, dry_run):
             f"\n[green]✓[/green] {len(node_id_map)} nodes, {written} edges written to Qdrant.\n"
             "[dim]Explore: ginja graph list  │  ginja graph search <query>  │  ginja graph show <label>[/dim]"
         )
+
+
+@graph.command("enrich")
+@click.option("--days", default=7, show_default=True, help="Enrich from memories in the last N days")
+def graph_enrich(days):
+    """Batch-enrich the knowledge graph from recent memories."""
+    cfg   = load_config()
+    model = _load_self_model()
+    cycle = model.get("evolution_count", 0)
+    try:
+        client = get_qdrant(cfg)
+        entries = scroll_recent(client, "memories", days=days)
+    except Exception as e:
+        console.print(f"[red]Could not load memories: {e}[/red]")
+        return
+
+    SIGNAL_SOURCES = {"evolution", "learn_oracle", "wonder", "user", "remember", "evolve_research"}
+    entries = [e for e in entries if e.get("source", "") in SIGNAL_SOURCES]
+    if not entries:
+        console.print(f"[yellow]No signal memories in the last {days} days.[/yellow]")
+        return
+
+    console.print(f"[dim]Enriching graph from {len(entries)} memories (last {days} days)…[/dim]")
+    for i, entry in enumerate(entries, 1):
+        text = entry.get("text", "")
+        if len(text) < 50:
+            continue
+        try:
+            _graph_enrich_text(text, cycle, cfg)
+            if i % 5 == 0:
+                console.print(f"  [dim]processed {i}/{len(entries)}…[/dim]")
+        except Exception:
+            pass
+
+    try:
+        kg_client = get_qdrant(cfg)
+        n_nodes = kg_client.count("kg_nodes").count
+        n_edges = kg_client.count("kg_edges").count
+        console.print(f"[bold green]✓ Enrichment complete[/bold green] — graph now has {n_nodes} nodes, {n_edges} edges.")
+    except Exception:
+        console.print("[green]✓ Enrichment complete.[/green]")
 
 
 if __name__ == "__main__":
