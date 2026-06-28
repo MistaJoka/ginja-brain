@@ -87,8 +87,8 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
 
     # ── Visual self-review (every 7th cycle — ginja critiques its own watch display) ──
     if (( CYCLE % 7 == 0 )); then
-        log "suggest-visuals: brain reviewing its own watch display"
-        "$GINJA" suggest-visuals >> "$LOG" 2>&1 \
+        log "suggest-visuals: brain reviewing and auto-implementing watch improvements"
+        "$GINJA" suggest-visuals --auto >> "$LOG" 2>&1 \
             && log "suggest-visuals: done" || log "suggest-visuals: FAILED (non-fatal)"
     fi
 

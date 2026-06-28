@@ -2849,8 +2849,17 @@ def reflect(store):
 
 
 @cli.command("suggest-visuals")
-def suggest_visuals():
-    """Ask the brain to critique its own watch display and suggest improvements."""
+@click.option("--auto", "auto_implement", is_flag=True,
+              help="Immediately implement code suggestions (no queue, no human step)")
+def suggest_visuals(auto_implement):
+    """Ask the brain to critique its own watch display and suggest improvements.
+
+    Without --auto: suggestions go into the approval queue.
+    With --auto: self-model updates apply immediately and code changes are
+    implemented on the spot (syntax-validated, backup taken). Used by the
+    autonomous evolution loop — safe because changes are scoped to
+    _make_watch_layout and validated before writing.
+    """
     cfg = load_config()
     console.print(Panel("[bold cyan]Visual self-review[/bold cyan]"))
 
@@ -2868,15 +2877,16 @@ def suggest_visuals():
         console.print("[yellow]Could not generate review.[/yellow]")
         return
 
-    critique = review.get("visual_critique", "")
-    updates  = review.get("self_model_updates", {})
+    critique    = review.get("visual_critique", "")
+    updates     = review.get("self_model_updates", {})
     suggestions = review.get("code_suggestions", [])
 
     if critique:
         console.print(Panel(f"[bold]My critique of my own display[/bold]\n\n{critique}"))
 
+    # ── Self-model updates — always applied immediately ────────────────────────
     if updates:
-        console.print("\n[bold green]Immediate improvements I'm applying now:[/bold green]")
+        console.print("\n[bold green]Applying self-model improvements:[/bold green]")
         current = _load_self_model()
         changed = []
         for k, v in updates.items():
@@ -2886,13 +2896,34 @@ def suggest_visuals():
                 changed.append(k)
         if changed:
             SELF_MODEL_FILE.write_text(json.dumps(current, indent=2))
-            console.print(f"  [green]✓[/green] self-model.json updated — ginja watch will reflect this within 5s")
+            console.print(f"  [green]✓[/green] self-model updated — watch reflects this within 5s")
         else:
-            console.print("  [dim]No changes needed — current display is already accurate.[/dim]")
+            console.print("  [dim]Display already accurate — no self-model changes.[/dim]")
 
-    if suggestions:
+    # ── Code suggestions — implement now or queue depending on mode ───────────
+    if not suggestions:
+        return
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    if auto_implement:
+        console.print("\n[bold cyan]Auto-implementing visual improvements:[/bold cyan]")
+        for s in suggestions:
+            console.print(f"  [cyan]✦[/cyan] {s}")
+            ok = _implement_code_suggestion(s, cfg)
+            entry = {
+                "id": str(uuid.uuid4()), "ts": ts, "evolution": 0,
+                "source": "suggest-visuals", "type": "code", "text": s,
+            }
+            _record_suggestion_outcome(entry, "implemented" if ok else "failed")
+            if ok:
+                with open(VISUAL_APPROVED, "a") as f:
+                    f.write(f"\n## [{ts}] auto\n- {s}\n")
+                console.print("    [green]✓ implemented[/green]")
+            else:
+                console.print("    [yellow]⚠ failed — skipped[/yellow]")
+    else:
         console.print("\n[bold cyan]Code-level suggestions queued for approval:[/bold cyan]")
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         new_items = []
         for s in suggestions:
             console.print(f"  [cyan]✦[/cyan] {s}")
@@ -2900,13 +2931,6 @@ def suggest_visuals():
                 "id": str(uuid.uuid4()), "ts": ts, "evolution": 0,
                 "source": "suggest-visuals", "critique": critique,
                 "type": "code", "text": s,
-            })
-        if updates:
-            new_items.append({
-                "id": str(uuid.uuid4()), "ts": ts, "evolution": 0,
-                "source": "suggest-visuals", "critique": critique,
-                "type": "self-model", "self_model_updates": updates,
-                "text": f"Visual refinement: {', '.join(updates.keys())}",
             })
         _add_suggestions(new_items)
         console.print(f"\n[dim]Run [bold]ginja approve[/bold] to review[/dim]")
