@@ -85,6 +85,13 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             && log "consolidate: done" || log "consolidate: FAILED (non-fatal)"
     fi
 
+    # ── Visual self-review (every 7th cycle — ginja critiques its own watch display) ──
+    if (( CYCLE % 7 == 0 )); then
+        log "suggest-visuals: brain reviewing its own watch display"
+        "$GINJA" suggest-visuals >> "$LOG" 2>&1 \
+            && log "suggest-visuals: done" || log "suggest-visuals: FAILED (non-fatal)"
+    fi
+
     # ── Self-eval (every 5th cycle) ───────────────────────────────────────────
     if (( CYCLE % 5 == 0 )); then
         log "eval: scoring evolution quality (cycle $CYCLE)"

@@ -3243,6 +3243,19 @@ def approve(list_only, no_curate, auto, code_cap):
             console.print(f"  [dim]All {code_count} suggestions are distinct — no consolidation needed[/dim]")
         console.print()
 
+    # In auto mode, float visual suggestions to the top so watch improvements
+    # are implemented before generic code suggestions.
+    if auto:
+        def _suggest_priority(item):
+            src = item.get("source", "")
+            if src == "suggest-visuals":
+                return 0   # highest priority
+            if item.get("type") == "self-model":
+                return 1   # self-model updates next
+            return 2       # general code suggestions last
+        pending = sorted(pending, key=_suggest_priority)
+        _save_suggestions(pending)
+
     total            = len(pending)
     remaining        = list(pending)
     approved_code    = []
