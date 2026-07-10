@@ -48,6 +48,12 @@ class LiveSignals:
         self.vram_total = 4096
         self.load = 0.0
         self.lock = None          # {"model": str, "since": iso} | None
+        self.gpu_history = []     # last 240 (t, gpu_pct) samples at 1 Hz
+        self.engines = None       # {engine: activity} — real telemetry
+        self.engine_detail = {}
+        self.mem_counts = {}
+        self._telemetry = None
+        self._tick = 0
         self._stop = threading.Event()
         self._thread = None
 
@@ -84,6 +90,24 @@ class LiveSignals:
             self.lock = json.loads(raw) if raw else None
         except Exception:
             self.lock = None
+        self.gpu_history.append((time.time(), self.gpu_pct))
+        if len(self.gpu_history) > 240:
+            self.gpu_history.pop(0)
+        # real engine telemetry every 5th poll (~5 s) — file mtimes + Qdrant counts
+        if self._tick % 5 == 0:
+            try:
+                if self._telemetry is None:
+                    from .telemetry import EngineTelemetry
+                    self._telemetry = EngineTelemetry()
+                self.engines = dict(self._telemetry.refresh({
+                    "gpu_pct": self.gpu_pct, "vram_used": self.vram_used,
+                    "vram_total": self.vram_total, "load": self.load,
+                    "lock": self.lock}))
+                self.engine_detail = dict(self._telemetry.detail)
+                self.mem_counts = dict(self._telemetry.counts)
+            except Exception:
+                pass
+        self._tick += 1
 
     def thinking_secs(self):
         """Seconds the current inference has been running, or None."""
@@ -134,14 +158,40 @@ class MirrorScene:
         jy = jit * R * 0.10 * math.sin(t * 3.3 + 1.0)
         cx, cy = cx + jx, cy + jy * self.aspect
 
+        # live telemetry overrides the spec's orbiter activities — real, not chosen
+        live = getattr(signals, "engines", None) if signals else None
+        orbiters = ([{"engine": o["engine"], "activity": live.get(o["engine"], o["activity"])}
+                     for o in s["orbiters"]] if live else s["orbiters"])
+
         self._weather(t, s["weather"])
         self._rings(cx, cy, R, s["rings"], t)
         self._core(s["core"], t, cx, cy, R * pulse, gpu)
-        overlay = self._orbiters(s["orbiters"], t, cx, cy, R)
+        overlay = self._orbiters(orbiters, t, cx, cy, R)
         self._particles(s["particles"], t, cx, cy, R)
         if thinking:
             self._flare(t, cx, cy, R * pulse)
+        self._sparkline(signals)
         return overlay
+
+    def _sparkline(self, signals):
+        """Real GPU history (1 Hz samples) as a braille strip along the bottom."""
+        hist = getattr(signals, "gpu_history", None) if signals else None
+        if not hist or len(hist) < 2:
+            return
+        h_px = 6
+        y0 = self.H - 1
+        n = min(len(hist), self.W)
+        samples = [g for _, g in hist[-n:]]
+        x_start = self.W - n
+        prev = None
+        for i, g in enumerate(samples):
+            x = x_start + i
+            y = y0 - int(g / 100 * h_px)
+            if prev is not None:
+                self.mid.line(x - 1, prev, x, y)
+            else:
+                self.mid.plot(x, y)
+            prev = y
 
     def _xy(self, cx, cy, r, ang):
         return cx + r * math.cos(ang), cy + r * math.sin(ang) * self.aspect
@@ -385,16 +435,30 @@ class MirrorScene:
               f"  ·  weather {s['weather']}\x1b[0m")
         lines = [_center_ansi(l1, self.cols), _center_ansi(l2, self.cols)]
         if signals is not None:
+            counts = getattr(signals, "mem_counts", None) or {}
+            vec = sum(counts.values())
+            base = (f"\x1b[38;5;{dimc}mgpu {signals.gpu_pct}%  ·  "
+                    f"vram {signals.vram_used / 1024:.1f}/{signals.vram_total / 1024:.1f}G  ·  "
+                    f"load {signals.load:.2f}"
+                    + (f"  ·  {vec:,} vectors" if vec else "") + "\x1b[0m")
             if signals.lock:
                 model = signals.lock.get("model", "?")
                 secs = int(signals.thinking_secs() or 0)
                 lines.append(_center_ansi(
-                    f"\x1b[38;5;{brightc}m▶ thinking with {model} · {secs}s\x1b[0m",
+                    f"\x1b[38;5;{brightc}m▶ thinking with {model} · {secs}s\x1b[0m  " + base,
                     self.cols))
             else:
+                lines.append(_center_ansi(base, self.cols))
+            # rotate through real per-engine detail so the numbers explain themselves
+            detail = getattr(signals, "engine_detail", None) or {}
+            if detail:
+                from .telemetry import ENGINES as _E
+                eng = _E[int(time.monotonic() / 4) % len(_E)]
+                act = (getattr(signals, "engines", None) or {}).get(eng, 0)
+                bar = "▰" * round(act * 8) + "▱" * (8 - round(act * 8))
                 lines.append(_center_ansi(
-                    f"\x1b[38;5;{dimc}mgpu {signals.gpu_pct}%  ·  load {signals.load:.2f}"
-                    f"  ·  idle\x1b[0m", self.cols))
+                    f"\x1b[38;5;{midc}m{eng}\x1b[0m \x1b[38;5;{brightc}m{bar}\x1b[0m "
+                    f"\x1b[38;5;{dimc}m{detail.get(eng, '')}\x1b[0m", self.cols))
         return lines
 
 
@@ -429,15 +493,20 @@ def mirror_strip(frame: int, self_model: dict, gpu_pct: int,
     if scene is None or scene[1] != spec_mtime:
         scene = (MirrorScene(specmod.load_spec(), cols, rows), spec_mtime)
         _strip_cache[key] = scene
-    sig = type("S", (), {"gpu_pct": gpu_pct, "lock": None, "load": 0.0})()
+    try:
+        raw = INFERENCE_LOCK.read_text().strip()
+        lock = json.loads(raw) if raw else None
+    except Exception:
+        lock = None
+    sig = type("S", (), {"gpu_pct": gpu_pct, "lock": lock, "load": 0.0})()
     return "\n".join(scene[0].frame(frame * 0.25, sig))
 
 
-def run(fps: float = 15.0):
+def run(fps: float = 24.0):
     """Full-screen mirror: raw ANSI on the alternate screen. Ctrl-C to exit."""
-    fps = max(1.0, min(30.0, fps))
+    fps = max(1.0, min(60.0, fps))
     size = shutil.get_terminal_size((100, 32))
-    cols, rows = size.columns, max(8, size.lines - 4)  # 3 status + 1 spare
+    cols, rows = size.columns, max(8, size.lines - 5)  # 4 status + 1 spare
 
     spec = specmod.load_spec()
     scene = MirrorScene(spec, cols, rows)

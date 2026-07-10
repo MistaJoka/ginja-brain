@@ -85,13 +85,35 @@ def _portrait_resolved():
             "_archetypes": arches}
 
 
+_telemetry = None
+
+
+def _engines(vitals):
+    """Real engine activities (see telemetry.py) — cached 5 s."""
+    def _load():
+        global _telemetry
+        from .telemetry import EngineTelemetry
+        if _telemetry is None:
+            _telemetry = EngineTelemetry()
+        acts = _telemetry.refresh(vitals)
+        return {"activity": dict(acts), "detail": dict(_telemetry.detail)}
+    try:
+        return _cached("engines", 5, _load)
+    except Exception:
+        return None
+
+
 def state():
-    return _cached("state", 2, lambda: {
-        "self_model": specmod.load_self_model(),
-        "portrait": _portrait_resolved(),
-        "vitals": _vitals(),
-        "ts": time.time(),
-    })
+    def _load():
+        vitals = _vitals()
+        return {
+            "self_model": specmod.load_self_model(),
+            "portrait": _portrait_resolved(),
+            "vitals": vitals,
+            "engines": _engines(vitals),
+            "ts": time.time(),
+        }
+    return _cached("state", 2, _load)
 
 
 def portrait():

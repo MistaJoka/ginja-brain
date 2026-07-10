@@ -3833,7 +3833,8 @@ def _portrait_review(cfg: dict) -> dict:
         "- core.radius (0.15-0.48), core.density (0.2-1.0), core.asymmetry (0.0-0.6)\n"
         "- rings: growth rings, usually evolution_count // 100\n"
         '- orbiters: [{"engine": name, "activity": 0.05-1.0}] for exactly these engines:\n'
-        f'  {", ".join(_spec.ENGINES)} — set activity by how alive each feels lately\n'
+        f'  {", ".join(_spec.ENGINES)} — fallback only: live renderers override activity\n'
+        "  with real telemetry (file freshness, Qdrant growth, inference lock, load)\n"
         "- pulse.base_hz (0.05-2.0) resting heartbeat, pulse.gpu_gain (0.0-3.0)\n"
         f'- weather: one of {", ".join(_spec.WEATHERS)} (your emotional sky)\n'
         f'- particles: {{"count": 0-120, "style": one of {", ".join(_spec.PARTICLE_STYLES)}}}\n'
@@ -3858,7 +3859,7 @@ def _portrait_review(cfg: dict) -> dict:
 
 
 @cli.command()
-@click.option("--fps", default=15.0, help="Target frames per second (1-30)")
+@click.option("--fps", default=24.0, help="Target frames per second (1-60)")
 def mirror(fps):
     """Full-screen braille self-portrait — the brain as it sees itself. Ctrl-C exits."""
     try:

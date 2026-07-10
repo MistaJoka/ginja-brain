@@ -165,7 +165,10 @@ const CAT = { tool: "#3987e5", concept: "#199e70", system: "#c98500",
 const ENGINE_GLYPHS = { Memory:"M", Cognition:"C", Perception:"P", Effector:"E",
                         Drive:"D", Safety:"S", Spine:"◆" };
 
-let spec = null, vitals = { gpu_pct: 0, lock: null }, selfModel = {};
+let spec = null, vitals = { gpu_pct: 0, lock: null }, selfModel = {}, engines = null;
+// live activity for an engine: real telemetry when present, spec fallback
+const engineAct = o => (engines && engines.activity && engines.activity[o.engine] != null)
+  ? engines.activity[o.engine] : o.activity;
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 function applyTheme(p) {
@@ -346,11 +349,12 @@ function orbiters(ctx, t, cx, cy, R, hx) {
   const n = spec.orbiters.length;
   ctx.font = "11px Menlo, monospace";
   spec.orbiters.forEach((o, i) => {
+    const act = engineAct(o);
     const orbit = R * (1.45 + 0.13 * (i % 3));
-    const a = TAU * i / n + t * (0.12 + 0.5 * o.activity);
+    const a = TAU * i / n + t * (0.12 + 0.5 * act);
     const x = cx + orbit * Math.cos(a), y = cy + orbit * Math.sin(a);
     ctx.fillStyle = hx.accent; glow(ctx, hx.accent, 8);
-    ctx.beginPath(); ctx.arc(x, y, 2 + 3 * o.activity, 0, TAU); ctx.fill(); noGlow(ctx);
+    ctx.beginPath(); ctx.arc(x, y, 2 + 3 * act, 0, TAU); ctx.fill(); noGlow(ctx);
     ctx.fillStyle = hx.text + "cc";
     ctx.fillText(ENGINE_GLYPHS[o.engine] || "?", x + 7, y + 3);
   });
@@ -643,12 +647,17 @@ function lineChart(el, seriesList, opts) {
 // ── Panels ────────────────────────────────────────────────────────────────────
 function renderEngines() {
   if (!spec) return;
-  $("engines").innerHTML = spec.orbiters.map(o => `
-    <div class="engine-row">
+  const detail = (engines && engines.detail) || {};
+  $("engines").innerHTML = spec.orbiters.map(o => {
+    const act = engineAct(o);
+    return `
+    <div class="engine-row" title="${detail[o.engine] || ""}">
       <span class="engine-name">${ENGINE_GLYPHS[o.engine]} ${o.engine}</span>
-      <div class="engine-track"><div class="engine-fill" style="width:${o.activity * 100}%"></div></div>
-      <span class="engine-val">${Math.round(o.activity * 100)}%</span>
-    </div>`).join("");
+      <div class="engine-track"><div class="engine-fill" style="width:${act * 100}%"></div></div>
+      <span class="engine-val">${Math.round(act * 100)}%</span>
+    </div>
+    <div style="color:var(--muted);font-size:10px;margin:-4px 0 6px 106px">${detail[o.engine] || ""}</div>`;
+  }).join("");
 }
 
 async function renderEvals() {
@@ -699,7 +708,7 @@ async function renderStory() {
 // ── Live state (SSE with polling fallback) ────────────────────────────────────
 function applyState(s) {
   const prevArch = spec && spec.archetype.primary;
-  spec = s.portrait; vitals = s.vitals; selfModel = s.self_model;
+  spec = s.portrait; vitals = s.vitals; selfModel = s.self_model; engines = s.engines;
   applyTheme(spec);
   renderEngines();
   $("banner").textContent = selfModel.ascii_banner || "◉ ginja-brain ◉";
