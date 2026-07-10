@@ -260,15 +260,26 @@ function core(ctx, t, cx, cy, R, gpu, hx) {
                  cy + (r0 + ln) * Math.sin(a + sway * 0.25));
       ctx.stroke();
     }
-    // nucleus: wandering, softly beating
-    const nx = cx + R * 0.16 * Math.sin(t * 0.23 + 1.1);
-    const ny = cy + R * 0.12 * Math.sin(t * 0.17);
+    // nucleus: its own morphing membrane, wandering on layered rhythms
+    const nx = cx + R * 0.20 * (Math.sin(t * 0.23 + 1.1) + 0.5 * Math.sin(t * 0.111 + 4.2));
+    const ny = cy + R * 0.16 * (Math.sin(t * 0.17) + 0.5 * Math.sin(t * 0.087 + 2.6));
     const nr = R * 0.24;
-    const grad = ctx.createRadialGradient(nx, ny, nr * 0.1, nx, ny, nr);
+    const nucR = a => nr * (1
+      + 0.18 * Math.sin(2 * a - t * 0.74 + 2.3)
+      + 0.12 * Math.sin(3 * a + t * 1.07)
+      + 0.06 * Math.sin(5 * a - t * 1.51 + 5.1));
+    const grad = ctx.createRadialGradient(nx, ny, nr * 0.1, nx, ny, nr * 1.4);
     grad.addColorStop(0, hx.accent + "cc");
     grad.addColorStop(1, hx.primary + "22");
     ctx.fillStyle = grad;
-    ctx.beginPath(); ctx.arc(nx, ny, nr, 0, TAU); ctx.fill();
+    ctx.beginPath();
+    const nSteps = 60;
+    for (let i = 0; i <= nSteps; i++) {
+      const a = TAU * i / nSteps, r = nucR(a);
+      const x = nx + r * Math.cos(a), y = ny + r * Math.sin(a);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.fill();
     // cytoplasm: particles on wobbly streamlines, clipped to the membrane
     const nCyt = 70 + 150 * den;
     for (let i = 0; i < nCyt; i++) {

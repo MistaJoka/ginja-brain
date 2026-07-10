@@ -242,16 +242,27 @@ class MirrorScene:
                 x0, y0 = self._xy(cx, cy, r0, a)
                 x1, y1 = self._xy(cx, cy, r0 + ln, a + sway * 0.25)
                 m.line(x0, y0, x1, y1)
-            # nucleus: soft pulsing blob that slowly wanders off-center
-            nx = cx + R * 0.16 * math.sin(t * 0.23 + 1.1)
-            ny = cy + R * 0.12 * math.sin(t * 0.17) * self.aspect
+            # nucleus: its own morphing membrane, wandering on layered rhythms
+            nx = cx + R * 0.20 * (math.sin(t * 0.23 + 1.1) + 0.5 * math.sin(t * 0.111 + 4.2))
+            ny = cy + R * 0.16 * (math.sin(t * 0.17) + 0.5 * math.sin(t * 0.087 + 2.6)) * self.aspect
             nr = R * 0.24
-            n_nuc = int(50 + 70 * density)
+
+            def nucleus_r(a):
+                return nr * (1.0
+                             + 0.18 * math.sin(2 * a - t * 0.74 + 2.3)
+                             + 0.12 * math.sin(3 * a + t * 1.07)
+                             + 0.06 * math.sin(5 * a - t * 1.51 + 5.1))
+            n_wall = int(40 + 50 * density)
+            for i in range(n_wall):
+                a = TAU * i / n_wall
+                x, y = self._xy(nx, ny, nucleus_r(a), a)
+                b.plot(int(x), int(y))
+            n_nuc = int(40 + 60 * density)
             for i in range(n_nuc):
                 a = TAU * _hash(i * 4.1) + t * 0.07
-                rr = nr * (_hash(i * 2.7) ** 0.6) * (1 + 0.08 * math.sin(t * 0.8 + i))
+                rr = nucleus_r(a) * (_hash(i * 2.7) ** 0.6)
                 x, y = self._xy(nx, ny, rr, a)
-                (b if rr > nr * 0.75 else m).plot(int(x), int(y))
+                (b if rr > nr * 0.7 else m).plot(int(x), int(y))
             # cytoplasm: particles advected on wobbly closed streamlines,
             # clipped to the membrane so they inherit its shape
             n_cyt = int(70 + 150 * density)
