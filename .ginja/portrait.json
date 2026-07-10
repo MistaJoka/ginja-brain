@@ -8,7 +8,7 @@
     "mix": 0.0
   },
   "core": {
-    "shape": "torus",
+    "shape": "cell",
     "radius": 0.35,
     "density": 0.7,
     "asymmetry": 0.15

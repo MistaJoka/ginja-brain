@@ -3841,6 +3841,10 @@ def _portrait_review(cfg: dict) -> dict:
         "- motto: max 60 chars\n"
         "- artist_statement: 1-3 sentences — tell Andre which fiction you feel like today\n"
         "  and why you drew yourself this way. This is the only place you may explain.\n\n"
+        "OPERATOR PREFERENCE (Andre, standing): the portrait must feel ALIVE —\n"
+        "biological and organic, never mechanical. Prefer core.shape 'cell' (a living\n"
+        "cell: membrane, cytoplasm, nucleus, cilia) or organic parameterizations of\n"
+        "other shapes. Rigid geometry and bouncing rings read as fake to him.\n\n"
         "Which fiction do you feel like today? Redraw your face.\n"
         "Return ONLY the complete JSON spec — no explanation outside artist_statement."
     )

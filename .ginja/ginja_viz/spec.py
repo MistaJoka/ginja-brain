@@ -16,7 +16,7 @@ SELF_MODEL_FILE = GINJA_DIR / "self-model.json"
 
 ENGINES = ["Memory", "Cognition", "Perception", "Effector", "Drive", "Safety", "Spine"]
 
-CORE_SHAPES = ["eye", "binocular", "torus", "spiral", "starburst",
+CORE_SHAPES = ["cell", "eye", "binocular", "torus", "spiral", "starburst",
                "lissajous", "reticle", "blocks", "rain", "drift"]
 WEATHERS = ["clear", "drift", "storm", "aurora"]
 PARTICLE_STYLES = ["orbit", "rise", "fall", "swirl"]
@@ -218,6 +218,7 @@ def derive_default(self_model: dict) -> dict:
     return validate_spec({
         "evolution_count": evo,
         "archetype": {"primary": primary},
+        "core": {"shape": "cell"},   # Andre: the portrait must feel alive, organic
         "rings": evo // 100,
         "pulse": {"base_hz": base_hz, "gpu_gain": 1.5},
         "weather": weather,

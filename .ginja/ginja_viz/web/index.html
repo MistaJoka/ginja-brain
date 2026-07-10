@@ -160,6 +160,13 @@ window.onerror = (msg, src, line) => {
 };
 const TAU = Math.PI * 2;
 const hash = i => (Math.sin(i * 12.9898 + 78.233) * 43758.5453) % 1 * 0.5 + 0.5;
+// cardiac lub-dub: sharp systole, softer diastole, long quiet interval
+const heartbeat = p => {
+  p = ((p % 1) + 1) % 1;
+  return Math.exp(-(((p - 0.06) / 0.045) ** 2)) + 0.45 * Math.exp(-(((p - 0.24) / 0.065) ** 2));
+};
+// respiration with drifting rate — organic, never metronomic
+const breath = t => 1 + 0.045 * Math.sin(TAU * t / 6.5 + 0.6 * Math.sin(t * 0.13));
 const CAT = { tool: "#3987e5", concept: "#199e70", system: "#c98500",
               goal: "#9085e9", technique: "#e66767" };
 const ENGINE_GLYPHS = { Memory:"M", Cognition:"C", Perception:"P", Effector:"E",
@@ -211,13 +218,13 @@ function portraitFrame(tms) {
   const cy = pH / 2 + jit * 5 * Math.sin(t * 3.3 + 1);
   const R = Math.min(pW, pH) * spec.core.radius;
   const hz = Math.max(0.05, spec.pulse.base_hz + bias + spec.pulse.gpu_gain * gpu);
-  const pulse = 1 + 0.1 * Math.sin(TAU * hz * t);
+  const pulse = breath(t) * (1 + (0.06 + 0.06 * gpu) * heartbeat(t * hz));
 
   weather(ctx, t, hx);
   // growth rings
   ctx.strokeStyle = hx.secondary + "55"; ctx.lineWidth = 1;
   for (let i = 0; i < spec.rings; i++) {
-    const rr = R * (1.15 + 0.14 * (i + 1)) * (1 + 0.02 * Math.sin(t * 0.4 + i));
+    const rr = R * (1.15 + 0.14 * (i + 1)) * breath(t + i * 1.7) * (1 + 0.015 * Math.sin(t * 0.4 + i * 2.3));
     ctx.beginPath(); ctx.arc(cx, cy, rr, 0, TAU); ctx.stroke();
   }
   core(ctx, t, cx, cy, R * pulse, gpu, hx);
@@ -233,7 +240,56 @@ function core(ctx, t, cx, cy, R, gpu, hx) {
   const shape = spec.core.shape, den = spec.core.density, asym = spec.core.asymmetry;
   ctx.fillStyle = hx.primary; ctx.strokeStyle = hx.primary; ctx.lineWidth = 1.5;
   glow(ctx, hx.primary, 14);
-  if (shape === "eye") {
+  if (shape === "cell") {
+    const memR = a => R * (1
+      + 0.10 * Math.sin(2 * a + t * 0.41)
+      + 0.065 * Math.sin(3 * a - t * 0.29 + 1.7)
+      + (0.045 + asym * 0.05) * Math.sin(5 * a + t * 0.53 + 4.0)
+      + 0.02 * Math.sin(9 * a - t * 0.9));
+    // membrane
+    ctx.beginPath();
+    const nMem = 160;
+    for (let i = 0; i <= nMem; i++) {
+      const a = TAU * i / nMem, r = memR(a);
+      const x = cx + r * Math.cos(a), y = cy + r * Math.sin(a);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = hx.primary + "10"; ctx.fill();
+    // cilia
+    ctx.strokeStyle = hx.secondary + "aa"; ctx.lineWidth = 1;
+    for (let k = 0; k < 26; k++) {
+      const a = TAU * k / 26 + 0.12 * Math.sin(t * 0.7 + k);
+      const r0 = memR(a), sway = 0.55 * Math.sin(t * 2.1 + k * 1.9 + hash(k) * TAU);
+      const ln = 5 + 6 * hash(k * 3.3);
+      ctx.beginPath();
+      ctx.moveTo(cx + r0 * Math.cos(a), cy + r0 * Math.sin(a));
+      ctx.lineTo(cx + (r0 + ln) * Math.cos(a + sway * 0.25),
+                 cy + (r0 + ln) * Math.sin(a + sway * 0.25));
+      ctx.stroke();
+    }
+    // nucleus: wandering, softly beating
+    const nx = cx + R * 0.16 * Math.sin(t * 0.23 + 1.1);
+    const ny = cy + R * 0.12 * Math.sin(t * 0.17);
+    const nr = R * 0.24 * (1 + 0.05 * heartbeat(t * 0.9 + 0.1));
+    const grad = ctx.createRadialGradient(nx, ny, nr * 0.1, nx, ny, nr);
+    grad.addColorStop(0, hx.accent + "cc");
+    grad.addColorStop(1, hx.primary + "22");
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(nx, ny, nr, 0, TAU); ctx.fill();
+    // cytoplasm: particles on wobbly streamlines, clipped to the membrane
+    const nCyt = 70 + 150 * den;
+    for (let i = 0; i < nCyt; i++) {
+      const h1 = hash(i * 1.9), h2 = hash(i * 5.3);
+      const w = 0.06 + 0.22 * h2;
+      const a = TAU * h1 + t * w * (1 + 0.35 * Math.sin(t * 0.21 + i));
+      const frac = 0.30 + 0.62 * (h2 ** 0.7) + 0.05 * Math.sin(t * 0.6 + i * 2.2);
+      const r = memR(a) * Math.min(0.93, frac);
+      ctx.fillStyle = h2 > 0.5 ? hx.secondary + "99" : hx.primary + "77";
+      ctx.beginPath();
+      ctx.arc(cx + r * Math.cos(a), cy + r * Math.sin(a), 1.4, 0, TAU); ctx.fill();
+    }
+  } else if (shape === "eye") {
     ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.stroke();
     ctx.fillStyle = hx.secondary + "88";
     const n = 40 + 80 * den;
@@ -350,9 +406,10 @@ function orbiters(ctx, t, cx, cy, R, hx) {
   ctx.font = "11px Menlo, monospace";
   spec.orbiters.forEach((o, i) => {
     const act = engineAct(o);
-    const orbit = R * (1.45 + 0.13 * (i % 3));
-    const a = TAU * i / n + t * (0.12 + 0.5 * act);
-    const x = cx + orbit * Math.cos(a), y = cy + orbit * Math.sin(a);
+    // firefly drift: wobbling radius, uneven speed, gentle bob
+    const orbit = R * (1.45 + 0.13 * (i % 3)) * (1 + 0.06 * Math.sin(t * 0.33 + i * 2.1));
+    const a = TAU * i / n + t * (0.12 + 0.5 * act) + 0.25 * Math.sin(t * 0.47 + hash(i) * TAU);
+    const x = cx + orbit * Math.cos(a), y = cy + orbit * Math.sin(a) + 3 * Math.sin(t * 1.3 + i * 2.7);
     ctx.fillStyle = hx.accent; glow(ctx, hx.accent, 8);
     ctx.beginPath(); ctx.arc(x, y, 2 + 3 * act, 0, TAU); ctx.fill(); noGlow(ctx);
     ctx.fillStyle = hx.text + "cc";

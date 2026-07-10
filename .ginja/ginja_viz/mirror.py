@@ -32,6 +32,20 @@ def _hash(i: float) -> float:
     return (math.sin(i * 12.9898 + 78.233) * 43758.5453) % 1.0
 
 
+def _heartbeat(phase: float) -> float:
+    """Cardiac 'lub-dub' waveform in [0, 1]: sharp systole, softer diastole,
+    long quiet interval — nothing biological pulses like a sine."""
+    p = phase % 1.0
+    lub = math.exp(-((p - 0.06) / 0.045) ** 2)
+    dub = 0.45 * math.exp(-((p - 0.24) / 0.065) ** 2)
+    return lub + dub
+
+
+def _breath(t: float) -> float:
+    """Slow respiration with natural variability (drifting rate, ~6.5 s cycle)."""
+    return 1.0 + 0.045 * math.sin(TAU * t / 6.5 + 0.6 * math.sin(t * 0.13))
+
+
 # ── Live signals ────────────────────────────────────────────────────────────────
 
 class LiveSignals:
@@ -152,7 +166,8 @@ class MirrorScene:
         R = s["core"]["radius"] * min(self.W, self.H / self.aspect)
         pulse_hz = max(0.05, s["pulse"]["base_hz"] + self.pal["pulse_bias"]
                        + s["pulse"]["gpu_gain"] * gpu)
-        pulse = 1.0 + 0.10 * math.sin(TAU * pulse_hz * t)
+        # heartbeat (lub-dub) modulated by breath — organic, not sinusoidal
+        pulse = _breath(t) * (1.0 + (0.06 + 0.06 * gpu) * _heartbeat(t * pulse_hz))
         jit = self.pal["jitter"]
         jx = jit * R * 0.15 * math.sin(t * 2.1)
         jy = jit * R * 0.10 * math.sin(t * 3.3 + 1.0)
@@ -202,7 +217,57 @@ class MirrorScene:
         asym = core["asymmetry"]
         b, m = self.bright, self.mid
 
-        if shape == "eye":
+        if shape == "cell":
+            # ── a living cell: morphing membrane, cytoplasm flow, nucleus, cilia ──
+            def membrane_r(a):
+                return R * (1.0
+                            + 0.10 * math.sin(2 * a + t * 0.41)
+                            + 0.065 * math.sin(3 * a - t * 0.29 + 1.7)
+                            + (0.045 + asym * 0.05) * math.sin(5 * a + t * 0.53 + 4.0)
+                            + 0.02 * math.sin(9 * a - t * 0.9))
+            # membrane: double-sampled dotted wall
+            n_mem = int(140 + 160 * density)
+            for i in range(n_mem):
+                a = TAU * i / n_mem
+                r = membrane_r(a)
+                x, y = self._xy(cx, cy, r, a)
+                b.plot(int(x), int(y))
+                if i % 2 == 0:
+                    x2, y2 = self._xy(cx, cy, r - 1.5, a)
+                    m.plot(int(x2), int(y2))
+            # cilia: short waving hairs on the membrane
+            n_cil = 26
+            for k in range(n_cil):
+                a = TAU * k / n_cil + 0.12 * math.sin(t * 0.7 + k)
+                r0 = membrane_r(a)
+                sway = 0.55 * math.sin(t * 2.1 + k * 1.9 + _hash(k) * TAU)
+                ln = 2.5 + 2.5 * _hash(k * 3.3)
+                x0, y0 = self._xy(cx, cy, r0, a)
+                x1, y1 = self._xy(cx, cy, r0 + ln, a + sway * 0.25)
+                m.line(x0, y0, x1, y1)
+            # nucleus: soft pulsing blob that slowly wanders off-center
+            nx = cx + R * 0.16 * math.sin(t * 0.23 + 1.1)
+            ny = cy + R * 0.12 * math.sin(t * 0.17) * self.aspect
+            nr = R * 0.24 * (1 + 0.05 * _heartbeat(t * 0.9 + 0.1))
+            n_nuc = int(50 + 70 * density)
+            for i in range(n_nuc):
+                a = TAU * _hash(i * 4.1) + t * 0.07
+                rr = nr * (_hash(i * 2.7) ** 0.6) * (1 + 0.08 * math.sin(t * 0.8 + i))
+                x, y = self._xy(nx, ny, rr, a)
+                (b if rr > nr * 0.75 else m).plot(int(x), int(y))
+            # cytoplasm: particles advected on wobbly closed streamlines,
+            # clipped to the membrane so they inherit its shape
+            n_cyt = int(70 + 150 * density)
+            for i in range(n_cyt):
+                h1, h2 = _hash(i * 1.9), _hash(i * 5.3)
+                w = 0.06 + 0.22 * h2                       # per-particle drift rate
+                a = TAU * h1 + t * w * (1 + 0.35 * math.sin(t * 0.21 + i))
+                frac = 0.30 + 0.62 * (h2 ** 0.7) + 0.05 * math.sin(t * 0.6 + i * 2.2)
+                r = membrane_r(a) * min(0.93, frac)
+                x, y = self._xy(cx, cy, r, a)
+                m.plot(int(x), int(y))
+
+        elif shape == "eye":
             b.ellipse(cx, cy, R, R * self.aspect)
             b.ellipse(cx, cy, R - 1, (R - 1) * self.aspect)
             iris = R * 0.60
@@ -328,9 +393,10 @@ class MirrorScene:
                 (m if _hash(i * 9) > 0.3 else b).plot(int(x + w), int(y))
 
     def _rings(self, cx, cy, R, rings, t):
+        # growth rings ripple outward like a disturbed pond, each on its own phase
         for i in range(rings):
             r = R * (1.15 + 0.14 * (i + 1))
-            wob = 1 + 0.02 * math.sin(t * 0.4 + i)
+            wob = _breath(t + i * 1.7) * (1 + 0.015 * math.sin(t * 0.4 + i * 2.3))
             self.dim.ellipse(cx, cy, r * wob, r * wob * self.aspect,
                              steps=int(20 + r * 1.5))
 
@@ -339,9 +405,12 @@ class MirrorScene:
         n = len(orbiters)
         for i, o in enumerate(orbiters):
             act = o["activity"]
-            orbit = R * (1.45 + 0.13 * (i % 3))
-            a = TAU * i / n + t * (0.12 + 0.5 * act)
+            # firefly drift: wobbling radius, uneven speed, gentle vertical bob
+            orbit = R * (1.45 + 0.13 * (i % 3)) * (1 + 0.06 * math.sin(t * 0.33 + i * 2.1))
+            a = (TAU * i / n + t * (0.12 + 0.5 * act)
+                 + 0.25 * math.sin(t * 0.47 + _hash(i) * TAU))
             x, y = self._xy(cx, cy, orbit, a)
+            y += 1.5 * math.sin(t * 1.3 + i * 2.7) * self.aspect
             size = 1 + int(act * 2)
             for rr in range(size):
                 self.mid.ellipse(x, y, rr, rr * self.aspect, steps=12)
