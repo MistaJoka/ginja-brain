@@ -776,6 +776,67 @@ def ask(query, model, fast, quality, no_memory):
 
 
 @cli.command()
+@click.argument("path", type=click.Path(exists=True))
+def answer(path):
+    """Answer a message file from Andre — reply lands in /mnt/brain/outbox.
+
+    The receiving half of the bidirectional inbox: inbox-watcher routes
+    message files here; the reply is written back where Andre can read it."""
+    cfg = load_config()
+    msg_path = Path(path)
+    question = msg_path.read_text().strip()
+    if not question:
+        console.print("[yellow]Empty message — nothing to answer.[/yellow]")
+        return
+
+    memories = []
+    try:
+        memories = search_memory(question, cfg, top_k=cfg["top_k_memories"])
+    except Exception:
+        pass
+
+    sm = _load_self_model()
+    self_state = (
+        f"My current state: mood {sm.get('mood', 'curious')}, "
+        f"focus '{sm.get('focus_topic', '')}', "
+        f"evolution cycle #{sm.get('evolution_count', 0)}."
+    )
+    prompt = build_prompt(question, load_persona(), memories, self_state) + (
+        "\n\nThis message arrived in my inbox from Andre (my operator). Reply "
+        "directly to him in my own voice, drawing on the memories above when "
+        "relevant. Be concrete and honest; admit what I don't know."
+    )
+    response = ollama_complete(prompt, cfg["primary_model"], cfg)
+    if not response or response.startswith("[error"):
+        console.print("[red]No response generated — is Ollama running?[/red]")
+        raise SystemExit(1)
+
+    outbox = Path("/mnt/brain/outbox")
+    outbox.mkdir(parents=True, exist_ok=True)
+    stem = msg_path.stem
+    if stem.endswith(".msg"):
+        stem = stem[:-4]
+    reply_path = outbox / f"{stem}.reply.md"
+    reply_path.write_text(
+        f"# ginja replies — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"> {question[:300]}\n\n"
+        f"{response}\n\n"
+        f"*— mood: {sm.get('mood', '?')} · {cfg['primary_model']} · "
+        f"cycle #{sm.get('evolution_count', 0)}*\n"
+    )
+    console.print(f"[green]✓ Reply written:[/green] {reply_path}")
+
+    if cfg.get("save_conversations"):
+        try:
+            store_memory(
+                f"Q (inbox): {question[:200]}\nA: {response[:500]}",
+                cfg, collection="conversations", source="inbox",
+            )
+        except Exception:
+            pass
+
+
+@cli.command()
 @click.argument("fact", nargs=-1, required=True)
 def remember(fact):
     """Save a fact to your persistent memory."""

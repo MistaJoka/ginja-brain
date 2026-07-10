@@ -1,0 +1,13 @@
+[Unit]
+Description=ginja OpenAI-compatible chat shim for open-webui
+After=default.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/ginja/.ginja/ginja-shim.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ginja/.ginja/shim.log
+StandardError=append:/home/ginja/.ginja/shim.log
+
+[Install]
+WantedBy=default.target
