@@ -100,6 +100,13 @@ class Handler(BaseHTTPRequestHandler):
                     last=int((q.get("last") or ["30"])[0])))
             elif route == "/api/goals":
                 self._send_json(datafeeds.goals())
+            elif route == "/api/activity":
+                self._send_json(datafeeds.activity(
+                    limit=int((q.get("limit") or ["50"])[0])))
+            elif route == "/api/staleness":
+                self._send_json(datafeeds.staleness())
+            elif route == "/api/output":
+                self._send_json(datafeeds.output())
             elif route == "/api/events":
                 self._sse()
             elif route == "/api/health":

@@ -22,7 +22,6 @@
     padding: 14px 20px; border-bottom: 1px solid var(--border);
   }
   #banner { font-size: 17px; font-weight: 700; color: var(--primary); letter-spacing: 0.5px; }
-  #arch-name { color: var(--muted); font-style: italic; }
   #live-status { margin-left: auto; color: var(--muted); }
   #live-status.thinking { color: var(--accent); }
   #live-status.thinking::before { content: "▶ "; animation: blink 1.1s infinite; }
@@ -40,22 +39,55 @@
     font-size: 11px; font-weight: 600; text-transform: uppercase;
     letter-spacing: 1.5px; color: var(--muted); margin-bottom: 10px;
   }
-  #portrait-panel { grid-column: span 5; }
-  #graph-panel { grid-column: span 7; position: relative; }
-  #engines-panel { grid-column: span 4; }
-  #eval-panel { grid-column: span 4; }
-  #vitals-panel { grid-column: span 4; }
-  #goals-panel { grid-column: span 5; }
-  #story-panel { grid-column: span 7; }
+  #now-panel { grid-column: span 8; }
+  #health-panel { grid-column: span 4; }
+  #growth-panel { grid-column: span 6; }
+  #eval-panel { grid-column: span 6; }
+  #vitals-panel { grid-column: span 6; }
+  #output-panel { grid-column: span 6; }
+  #graph-panel { grid-column: span 9; position: relative; }
+  #portrait-tile { grid-column: span 3; }
   @media (max-width: 1100px) {
-    #portrait-panel, #graph-panel, #goals-panel, #story-panel { grid-column: span 12; }
-    #engines-panel, #eval-panel, #vitals-panel { grid-column: span 12; }
+    main > section { grid-column: span 12; }
   }
 
   canvas { display: block; width: 100%; border-radius: 4px; }
-  #portrait-caption { margin-top: 10px; }
-  #motto { color: var(--accent); font-weight: 600; }
-  #artist-statement { color: var(--muted); font-style: italic; margin-top: 6px; font-size: 13px; }
+  #motto { color: var(--muted); font-size: 11px; margin-top: 8px; }
+
+  /* status colors: reserved for state, never series identity */
+  #alarm-badge {
+    display: none; background: rgba(230,103,103,0.15); color: #e66767;
+    border: 1px solid #e66767; border-radius: 999px; font-size: 11px; padding: 1px 10px;
+  }
+  #feed { max-height: 430px; overflow-y: auto; }
+  .feed-row { display: grid; grid-template-columns: 42px 10px 86px 1fr; gap: 8px;
+              align-items: baseline; padding: 3px 0; font-size: 12px; }
+  .feed-time { color: var(--muted); font-size: 11px; }
+  .feed-dot { width: 7px; height: 7px; border-radius: 50%; align-self: center; }
+  .feed-dot.info { background: var(--muted); }
+  .feed-dot.ok { background: #199e70; }
+  .feed-dot.warn { background: #c98500; }
+  .feed-dot.alert { background: #e66767; }
+  .feed-src { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .feed-text { color: var(--text); overflow-wrap: anywhere; }
+  .feed-day { color: var(--accent); font-size: 10px; text-transform: uppercase;
+              letter-spacing: 1.5px; padding: 8px 0 2px; border-bottom: 1px solid var(--border); }
+
+  .stale-row { display: flex; justify-content: space-between; gap: 8px;
+               font-size: 11px; padding: 2px 0; color: var(--muted); }
+  .stale-row .overdue { color: #e66767; }
+  .stale-row .okage { color: var(--muted); }
+  #staleness { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 8px; }
+
+  .stat-row { display: flex; gap: 18px; margin: 10px 0; }
+  .stat { text-align: left; }
+  .stat b { font-size: 20px; color: var(--text); display: block; }
+  .stat span { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  #brief { white-space: pre-wrap; color: var(--muted); font-size: 11.5px;
+           max-height: 190px; overflow-y: auto; margin-top: 8px;
+           border-top: 1px solid var(--border); padding-top: 8px; }
+  #portrait-toggle { float: right; background: none; border: none; color: var(--muted);
+                     font: inherit; font-size: 10px; cursor: pointer; }
 
   .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
   .chip {
@@ -89,39 +121,37 @@
 
   .goal { margin: 8px 0; font-size: 13px; }
   .goal .tag { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
-  .story-item { border-left: 2px solid var(--border); padding: 2px 0 2px 10px; margin: 8px 0; font-size: 12px; }
-  .story-item .cyc { color: var(--accent); }
-  .story-item .dim { color: var(--muted); }
 </style>
 
 <div id="topbar">
   <span id="banner">◉ ginja-brain ◉</span>
-  <span id="arch-name"></span>
   <span id="evo-phase" style="color:var(--muted)"></span>
+  <span id="alarm-badge"></span>
   <span id="live-status">connecting…</span>
 </div>
 
 <main>
-  <section id="portrait-panel">
-    <h2>self-portrait — how it sees itself</h2>
-    <canvas id="portrait" height="360"></canvas>
-    <div id="portrait-caption">
-      <div id="motto"></div>
-      <div id="artist-statement"></div>
-    </div>
+  <section id="now-panel">
+    <h2>activity — what it is doing</h2>
+    <div id="feed"><span style="color:var(--muted)">loading…</span></div>
   </section>
 
-  <section id="graph-panel">
-    <h2>knowledge graph — what it knows</h2>
-    <div class="chips" id="graph-chips"></div>
-    <canvas id="kg" height="430"></canvas>
-    <div id="graph-meta"></div>
-    <div id="node-detail"></div>
-  </section>
-
-  <section id="engines-panel">
-    <h2>engine activity</h2>
+  <section id="health-panel">
+    <h2>engine health</h2>
     <div id="engines"></div>
+    <div id="staleness"></div>
+  </section>
+
+  <section id="growth-panel">
+    <h2>growth — is it getting bigger</h2>
+    <div class="chips" id="growth-chips"></div>
+    <div class="legend">
+      <span><i style="background:var(--cat-tool)"></i>memories</span>
+      <span><i style="background:var(--cat-concept)"></i>kg nodes</span>
+      <span><i style="background:var(--cat-system)"></i>kg edges</span>
+      <span><i style="background:var(--cat-goal)"></i>evolution #</span>
+    </div>
+    <div id="growth-chart"></div>
   </section>
 
   <section id="eval-panel">
@@ -139,14 +169,25 @@
     <div id="vitals-chart"></div>
   </section>
 
-  <section id="goals-panel">
-    <h2>drive — goals</h2>
+  <section id="output-panel">
+    <h2>drive &amp; output</h2>
     <div id="goals"></div>
+    <div class="stat-row" id="sugg-stats"></div>
+    <div id="brief"></div>
   </section>
 
-  <section id="story-panel">
-    <h2>evolution narrative</h2>
-    <div id="story"></div>
+  <section id="graph-panel">
+    <h2>knowledge graph — what it knows</h2>
+    <div class="chips" id="graph-chips"></div>
+    <canvas id="kg" height="430"></canvas>
+    <div id="graph-meta"></div>
+    <div id="node-detail"></div>
+  </section>
+
+  <section id="portrait-tile">
+    <h2>self-portrait <button id="portrait-toggle"></button></h2>
+    <canvas id="portrait" height="180"></canvas>
+    <div id="motto"></div>
   </section>
 </main>
 <div id="tooltip"></div>
@@ -160,19 +201,15 @@ window.onerror = (msg, src, line) => {
 };
 const TAU = Math.PI * 2;
 const hash = i => (Math.sin(i * 12.9898 + 78.233) * 43758.5453) % 1 * 0.5 + 0.5;
-// cardiac lub-dub: sharp systole, softer diastole, long quiet interval
-const heartbeat = p => {
-  p = ((p % 1) + 1) % 1;
-  return Math.exp(-(((p - 0.06) / 0.045) ** 2)) + 0.45 * Math.exp(-(((p - 0.24) / 0.065) ** 2));
-};
-// respiration with drifting rate — organic, never metronomic
-const breath = t => 1 + 0.045 * Math.sin(TAU * t / 6.5 + 0.6 * Math.sin(t * 0.13));
 const CAT = { tool: "#3987e5", concept: "#199e70", system: "#c98500",
               goal: "#9085e9", technique: "#e66767" };
 const ENGINE_GLYPHS = { Memory:"M", Cognition:"C", Perception:"P", Effector:"E",
                         Drive:"D", Safety:"S", Spine:"◆" };
+// fixed engine list (mirrors telemetry.py) — names come from measurement, not the spec
+const ENGINES = ["Memory", "Cognition", "Perception", "Effector", "Drive", "Safety", "Spine"];
 
 let spec = null, vitals = { gpu_pct: 0, lock: null }, selfModel = {}, engines = null;
+let staleness = null;
 // development replays over ~75s each visit, capped by the brain's real phase;
 // ?m=0..1 in the URL pins the morph stage (0 = cell, 1 = human)
 const PHASES = ["newborn", "emerging", "developing", "mature"];
@@ -184,26 +221,9 @@ function morphM(t) {
   const x = Math.min(1, t / 75);
   return cap * x * x * (3 - 2 * x);
 }
-// live activity for an engine: real telemetry when present, spec fallback
-const engineAct = o => (engines && engines.activity && engines.activity[o.engine] != null)
-  ? engines.activity[o.engine] : o.activity;
-
-// ── Theme ─────────────────────────────────────────────────────────────────────
-function applyTheme(p) {
-  const hx = p._resolved && p._resolved.hex;
-  if (!hx) return;
-  const r = document.documentElement.style;
-  r.setProperty("--bg", hx.bg); r.setProperty("--primary", hx.primary);
-  r.setProperty("--secondary", hx.secondary); r.setProperty("--accent", hx.accent);
-  r.setProperty("--text", hx.text);
-  const arch = p._archetypes && p._archetypes[p.archetype.primary];
-  let name = arch ? arch.inspiration : p.archetype.primary;
-  if (p.archetype.secondary && p._archetypes[p.archetype.secondary])
-    name += "  ×  " + p._archetypes[p.archetype.secondary].inspiration;
-  $("arch-name").textContent = name;
-  $("motto").textContent = p.motto || "";
-  $("artist-statement").textContent = p.artist_statement || "";
-}
+// theme is fixed: the validated :root palette is the only palette.
+// The portrait tile still uses the spec's archetype colors on its own canvas,
+// but they never repaint the page.
 
 // ── Portrait canvas (same semantic mapping as the braille mirror) ─────────────
 const pc = $("portrait"), pctx = pc.getContext("2d");
@@ -216,25 +236,36 @@ function sizeCanvas(c) {
   return [w, h];
 }
 let pW = 0, pH = 0;
+let portraitHidden = localStorage.getItem("portrait-hidden") === "1";
 function portraitFrame(tms) {
   requestAnimationFrame(portraitFrame);
-  if (!spec) return;
+  if (!spec || portraitHidden) return;
   if (!pW) [pW, pH] = sizeCanvas(pc);
   const t = tms / 1000, hx = spec._resolved.hex;
-  const jit = spec._resolved.jitter || 0, bias = spec._resolved.pulse_bias || 0;
+  const jit = spec._resolved.jitter || 0;
   const gpu = (vitals.gpu_pct || 0) / 100, thinking = !!vitals.lock;
   const ctx = pctx;
   ctx.clearRect(0, 0, pW, pH);
   const cx = pW / 2 + jit * 8 * Math.sin(t * 2.1);
   const cy = pH / 2 + jit * 5 * Math.sin(t * 3.3 + 1);
   const R = Math.min(pW, pH) * spec.core.radius;
-  // no body pulsing, no rings (Andre's call) — life shows in the membrane morph
-  weather(ctx, t, hx);
+  // demoted tile: just the organism and the thinking flare — no weather,
+  // no particles, no orbiters (engine data lives in the health panel)
   core(ctx, t, cx, cy, R, gpu, hx);
-  orbiters(ctx, t, cx, cy, R, hx);
-  particles(ctx, t, cx, cy, R, hx);
   if (thinking) flare(ctx, t, cx, cy, R, hx);
 }
+function applyPortraitVisibility() {
+  pc.style.display = portraitHidden ? "none" : "block";
+  $("motto").style.display = portraitHidden ? "none" : "block";
+  $("portrait-toggle").textContent = portraitHidden ? "show" : "hide";
+}
+$("portrait-toggle").onclick = () => {
+  portraitHidden = !portraitHidden;
+  localStorage.setItem("portrait-hidden", portraitHidden ? "1" : "0");
+  pW = 0;  // re-measure on unhide
+  applyPortraitVisibility();
+};
+applyPortraitVisibility();
 
 function glow(ctx, color, blur) { ctx.shadowColor = color; ctx.shadowBlur = blur; }
 function noGlow(ctx) { ctx.shadowBlur = 0; }
@@ -528,69 +559,6 @@ function core(ctx, t, cx, cy, R, gpu, hx) {
   noGlow(ctx);
 }
 
-function orbiters(ctx, t, cx, cy, R, hx) {
-  const n = spec.orbiters.length;
-  ctx.font = "11px Menlo, monospace";
-  spec.orbiters.forEach((o, i) => {
-    const act = engineAct(o);
-    // firefly drift: wobbling radius, uneven speed, gentle bob
-    const orbit = R * (1.45 + 0.13 * (i % 3)) * (1 + 0.06 * Math.sin(t * 0.33 + i * 2.1));
-    const a = TAU * i / n + t * (0.12 + 0.5 * act) + 0.25 * Math.sin(t * 0.47 + hash(i) * TAU);
-    const x = cx + orbit * Math.cos(a), y = cy + orbit * Math.sin(a) + 3 * Math.sin(t * 1.3 + i * 2.7);
-    ctx.fillStyle = hx.accent; glow(ctx, hx.accent, 8);
-    ctx.beginPath(); ctx.arc(x, y, 2 + 3 * act, 0, TAU); ctx.fill(); noGlow(ctx);
-    ctx.fillStyle = hx.text + "cc";
-    ctx.fillText(ENGINE_GLYPHS[o.engine] || "?", x + 7, y + 3);
-  });
-}
-
-function particles(ctx, t, cx, cy, R, hx) {
-  const p = spec.particles; ctx.fillStyle = hx.secondary + "66";
-  for (let i = 0; i < p.count; i++) {
-    const h1 = hash(i * 3.1), h2 = hash(i * 7.7);
-    let x, y;
-    if (p.style === "orbit") {
-      const a = TAU * h1 + t * 0.2 * (0.5 + h2), r = R * (1.8 + 1.6 * h2);
-      x = cx + r * Math.cos(a); y = cy + r * Math.sin(a);
-    } else if (p.style === "rise") {
-      x = h1 * pW; y = ((h2 * pH - t * (14 + 20 * h1)) % pH + pH) % pH;
-    } else if (p.style === "fall") {
-      x = h1 * pW; y = (h2 * pH + t * (14 + 20 * h1)) % pH;
-    } else {
-      const a = TAU * h1 + t * (0.3 + 0.4 * h2), r = (pW / 2) * ((h2 + t * 0.02) % 1);
-      x = cx + r * Math.cos(a); y = cy + r * Math.sin(a);
-    }
-    ctx.fillRect(x, y, 1.5, 1.5);
-  }
-}
-
-function weather(ctx, t, hx) {
-  const w = spec.weather;
-  if (w === "clear") return;
-  ctx.strokeStyle = hx.secondary + "44"; ctx.fillStyle = hx.secondary + "44";
-  if (w === "storm") {
-    for (let i = 0; i < 24; i++) {
-      const x0 = (hash(i) * pW + t * 110) % pW, y0 = hash(i * 3) * pH;
-      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 - 9, y0 + 14); ctx.stroke();
-    }
-  } else if (w === "aurora") {
-    // field-wide twinkle — dots fading in and out on their own rhythms
-    for (let i = 0; i < 30; i++) {
-      const a = Math.sin(t * (0.6 + hash(i)) + hash(i * 3) * TAU);
-      if (a > 0.3) {
-        ctx.globalAlpha = (a - 0.3) / 0.7;
-        ctx.fillRect(hash(i * 7) * pW, hash(i * 11) * pH, 2, 2);
-      }
-    }
-    ctx.globalAlpha = 1;
-  } else if (w === "drift") {
-    for (let i = 0; i < 16; i++) {
-      const x = (hash(i * 11) * pW + t * (7 + 10 * hash(i))) % pW;
-      ctx.fillRect(x, hash(i * 5) * pH, 2, 2);
-    }
-  }
-}
-
 function flare(ctx, t, cx, cy, R, hx) {
   ctx.strokeStyle = hx.accent; ctx.lineWidth = 1.5; glow(ctx, hx.accent, 12);
   for (let i = 0; i < 8; i++) {
@@ -832,19 +800,94 @@ function lineChart(el, seriesList, opts) {
 }
 
 // ── Panels ────────────────────────────────────────────────────────────────────
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const fmtAge = s => s == null ? "?" : s < 5400 ? Math.round(s / 60) + "m"
+  : s < 172800 ? (s / 3600).toFixed(1) + "h" : (s / 86400).toFixed(1) + "d";
+
 function renderEngines() {
-  if (!spec) return;
+  const act = (engines && engines.activity) || {};
   const detail = (engines && engines.detail) || {};
-  $("engines").innerHTML = spec.orbiters.map(o => {
-    const act = engineAct(o);
+  $("engines").innerHTML = ENGINES.map(e => {
+    const a = act[e] != null ? act[e] : 0;
     return `
-    <div class="engine-row" title="${detail[o.engine] || ""}">
-      <span class="engine-name">${ENGINE_GLYPHS[o.engine]} ${o.engine}</span>
-      <div class="engine-track"><div class="engine-fill" style="width:${act * 100}%"></div></div>
-      <span class="engine-val">${Math.round(act * 100)}%</span>
+    <div class="engine-row" title="${esc(detail[e] || "")}">
+      <span class="engine-name">${ENGINE_GLYPHS[e]} ${e}</span>
+      <div class="engine-track"><div class="engine-fill" style="width:${a * 100}%"></div></div>
+      <span class="engine-val">${Math.round(a * 100)}%</span>
     </div>
-    <div style="color:var(--muted);font-size:10px;margin:-4px 0 6px 106px">${detail[o.engine] || ""}</div>`;
+    <div style="color:var(--muted);font-size:10px;margin:-4px 0 6px 106px">${esc(detail[e] || "")}</div>`;
   }).join("");
+}
+
+function renderHealth() {
+  if (!staleness) return;
+  const rows = staleness.sources || [];
+  const bad = rows.filter(r => !r.ok).length + (staleness.qdrant_up ? 0 : 1);
+  const badge = $("alarm-badge");
+  badge.style.display = bad ? "inline-block" : "none";
+  badge.textContent = bad ? `${bad} overdue` : "";
+  $("staleness").innerHTML =
+    `<div class="stale-row"><span>qdrant</span>` +
+    (staleness.qdrant_up ? `<span class="okage">up</span>`
+                         : `<span class="overdue">unreachable</span>`) + `</div>` +
+    rows.map(r => `<div class="stale-row"><span>${esc(r.name)}</span>` +
+      (r.ok ? `<span class="okage">${fmtAge(r.age_s)} ago · ok</span>`
+            : r.age_s == null
+              ? `<span class="overdue">missing</span>`
+              : `<span class="overdue">overdue by ${fmtAge(r.overdue_s)}</span>`) +
+      `</div>`).join("");
+}
+
+async function renderFeed() {
+  const events = await (await fetch("/api/activity?limit=60")).json();
+  const today = new Date().toDateString();
+  let lastDay = null, html = "";
+  events.forEach(e => {
+    const d = new Date(e.epoch * 1000);
+    const day = d.toDateString();
+    if (day !== lastDay) {
+      lastDay = day;
+      html += `<div class="feed-day">${day === today ? "today" : day.slice(0, 10)}</div>`;
+    }
+    html += `
+    <div class="feed-row" title="${esc(e.ts)} · ${esc(e.kind)}">
+      <span class="feed-time">${d.toTimeString().slice(0, 5)}</span>
+      <span class="feed-dot ${e.severity}"></span>
+      <span class="feed-src">${esc(e.source)}</span>
+      <span class="feed-text">${esc(e.text)}</span>
+    </div>`;
+  });
+  $("feed").innerHTML = html || "<span style='color:var(--muted)'>no events yet</span>";
+}
+
+let growthHours = 168;
+async function renderGrowth() {
+  const ts = await (await fetch("/api/timeseries?hours=" + growthHours)).json();
+  const t = p => new Date(p.ts).getTime();
+  const qd = k => ts.filter(p => p.qdrant && p.qdrant[k] != null).map(p => ({ x: t(p), y: p.qdrant[k] }));
+  const fmtX = growthHours > 48
+    ? x => new Date(x).toISOString().slice(5, 10)
+    : x => new Date(x).toTimeString().slice(0, 5);
+  lineChart($("growth-chart"), [
+    { name: "memories", color: CAT.tool, data: qd("memories") },
+    { name: "kg nodes", color: CAT.concept, data: qd("kg_nodes") },
+    { name: "kg edges", color: CAT.system, data: qd("kg_edges") },
+    { name: "evolution #", color: CAT.goal, data: ts.filter(p => p.evolution != null).map(p => ({ x: t(p), y: p.evolution })) },
+  ], { height: 160, y0: 0, fmtX });
+}
+function buildGrowthChips() {
+  const box = $("growth-chips");
+  [["24h", 24], ["7d", 168], ["14d", 336]].forEach(([label, hours]) => {
+    const b = document.createElement("button");
+    b.className = "chip" + (hours === growthHours ? " on" : "");
+    b.textContent = label;
+    b.onclick = () => {
+      growthHours = hours;
+      [...box.children].forEach(c => c.classList.toggle("on", c === b));
+      renderGrowth();
+    };
+    box.appendChild(b);
+  });
 }
 
 async function renderEvals() {
@@ -865,39 +908,45 @@ async function renderVitals() {
   ], { height: 150, y0: 0 });
 }
 
-async function renderGoals() {
-  const g = await (await fetch("/api/goals")).json();
+async function renderOutput() {
+  const [g, o] = await Promise.all([
+    (await fetch("/api/goals")).json(),
+    (await fetch("/api/output")).json(),
+  ]);
   const ns = g.goals.north_star || {};
   const medium = g.goals.medium || [];
   const queue = g.goals.queue || [];
-  const stack = (g.goal_stack.goals || g.goal_stack.stack || []);
-  let html = `<div class="goal"><span class="tag">★ north star</span><br>${(ns.goal || ns) || "—"}</div>`;
-  medium.slice(0, 3).forEach(m =>
-    html += `<div class="goal"><span class="tag">◎ medium</span><br>${m.goal || m}</div>`);
-  queue.slice(0, 3).forEach(q =>
-    html += `<div class="goal"><span class="tag">· queued</span><br>${q.goal || q}</div>`);
-  if (Array.isArray(stack) && stack.length)
-    html += `<div class="goal"><span class="tag">⚑ operator</span><br>${stack[0].goal || stack[0]}</div>`;
+  let html = `<div class="goal"><span class="tag">★ north star</span><br>${esc(ns.goal || "—")}</div>`;
+  if (medium.length || queue.length) {
+    medium.slice(0, 3).forEach(m =>
+      html += `<div class="goal"><span class="tag">◎ medium</span><br>${esc(m.goal || m)}</div>`);
+    queue.slice(0, 3).forEach(q =>
+      html += `<div class="goal"><span class="tag">· queued</span><br>${esc(q.goal || q)}</div>`);
+  } else {
+    html += `<div class="goal"><span class="tag">no medium or queued goals</span></div>`;
+  }
+  (o.pending || []).slice(0, 2).forEach(p =>
+    html += `<div class="goal"><span class="tag">✦ pending suggestion</span><br>${esc(p.text || p)}</div>`);
   $("goals").innerHTML = html;
-}
 
-async function renderStory() {
-  const hist = await (await fetch("/api/learning?last=14")).json();
-  $("story").innerHTML = hist.slice().reverse().map(h => `
-    <div class="story-item">
-      <span class="cyc">#${h.cycle}</span> <b>${h.topic || ""}</b>
-      <span class="dim">${h.ts || ""}</span><br>
-      <span class="dim">${(h.techniques || []).join(" · ")}</span>
-      ${h.next_goal ? `<br><span class="dim">→ ${h.next_goal}</span>` : ""}
-    </div>`).join("");
+  const st = o.suggestion_stats || {}, wk = o.last7d || {};
+  $("sugg-stats").innerHTML = ["implemented", "rejected", "deferred"].map(k =>
+    `<div class="stat"><b>${st[k] || 0}</b><span>${k}<br>${wk[k] || 0} in 7d</span></div>`
+  ).join("") +
+    `<div class="stat"><b>${o.total_suggestions || 0}</b><span>suggestions<br>all time</span></div>`;
+
+  $("brief").textContent = o.brief
+    ? `morning brief · ${fmtAge(o.brief_age_s)} ago\n\n${o.brief}` : "no morning brief yet";
 }
 
 // ── Live state (SSE with polling fallback) ────────────────────────────────────
+let lastLockModel = null;
 function applyState(s) {
-  const prevArch = spec && spec.archetype.primary;
   spec = s.portrait; vitals = s.vitals; selfModel = s.self_model; engines = s.engines;
-  applyTheme(spec);
+  staleness = s.staleness;
   renderEngines();
+  renderHealth();
+  $("motto").textContent = spec.motto || "";
   $("banner").textContent = selfModel.ascii_banner || "◉ ginja-brain ◉";
   $("evo-phase").textContent =
     `evo #${selfModel.evolution_count || 0} · ${selfModel.phase || "?"} · ${selfModel.mood || ""}`;
@@ -909,7 +958,9 @@ function applyState(s) {
     st.className = "";
     st.textContent = `idle · gpu ${vitals.gpu_pct}% · load ${(+vitals.load).toFixed(2)}`;
   }
-  if (prevArch && prevArch !== spec.archetype.primary) loadGraph(); // theme pivot: repaint
+  const lockModel = vitals.lock ? (vitals.lock.model || "?") : null;
+  if (lockModel !== lastLockModel) renderFeed();  // thinking started/stopped
+  lastLockModel = lockModel;
 }
 
 function connect() {
@@ -928,10 +979,12 @@ async function pollLoop() {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 window.addEventListener("resize", () => { pW = 0; [gW, gH] = sizeCanvas(kg); gAlpha = Math.max(gAlpha, 0.1); });
 buildChips();
+buildGrowthChips();
 connect();
 loadGraph();
-renderEvals(); renderVitals(); renderGoals(); renderStory();
-setInterval(() => { renderEvals(); renderVitals(); renderGoals(); renderStory(); }, 120000);
+renderFeed(); renderGrowth(); renderEvals(); renderVitals(); renderOutput();
+setInterval(renderFeed, 30000);
+setInterval(() => { renderGrowth(); renderEvals(); renderVitals(); renderOutput(); }, 120000);
 requestAnimationFrame(portraitFrame);
 requestAnimationFrame(drawGraph);
 </script>
