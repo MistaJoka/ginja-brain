@@ -233,7 +233,7 @@ function portraitFrame(tms) {
   core(ctx, t, cx, cy, R, gpu, hx);
   orbiters(ctx, t, cx, cy, R, hx);
   particles(ctx, t, cx, cy, R, hx);
-  if (thinking) flare(ctx, t, cx, cy, R * pulse, hx);
+  if (thinking) flare(ctx, t, cx, cy, R, hx);
 }
 
 function glow(ctx, color, blur) { ctx.shadowColor = color; ctx.shadowBlur = blur; }
@@ -244,17 +244,22 @@ function core(ctx, t, cx, cy, R, gpu, hx) {
   ctx.fillStyle = hx.primary; ctx.strokeStyle = hx.primary; ctx.lineWidth = 1.5;
   glow(ctx, hx.primary, 14);
   if (shape === "cell") {
-    // a lifeform that EVOLVES: cell → elongation → limb buds → human.
-    // replays development each session, capped by the brain's real phase
+    // ontogeny: cell → curled fetus → standing human (capped by real phase)
     const mph = morphM(t);
-    const mT = mph;
-    const mL = Math.max(0, Math.min(1, (mph - 0.45) / 0.55));
-    const mh = Math.max(0, Math.min(1, (mph - 0.50) / 0.35));
+    const sm3 = x => x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x);
+    const be = sm3((mph - 0.35) / 0.20);
+    const uSt = sm3((mph - 0.52) / 0.40);
+    const mh = sm3((mph - 0.35) / 0.25);
+    const hf = sm3((mph - 0.82) / 0.18);
+
+    const sFull = 0.86 * pH / 7.5;
+    const sEmb = 0.5 * R;
+    const S = sEmb + (sFull - sEmb) * sm3((mph - 0.38) / 0.62);
 
     const amp = 1 - 0.55 * mph;
-    const sx = 1 - 0.32 * mph, sy = 1 + 0.62 * mph;
-    const S = R * 1.55;
-    const memCy = cy + 0.07 * S * mph;
+    const smm = sm3((mph - 0.35) / 0.50);
+    const sxf = 1 + (Math.max(0.5, 1.65 * S / R) - 1) * smm;
+    const syf = 1 + (Math.max(1.0, 4.05 * S / R) - 1) * smm;
 
     const memF = a => 1
       + amp * 0.20 * Math.sin(2 * a + t * 0.90)
@@ -263,68 +268,113 @@ function core(ctx, t, cx, cy, R, gpu, hx) {
       + amp * 0.04 * Math.sin(9 * a - t * 1.90);
     const memXY = (a, frac = 1) => {
       const f = memF(a) * frac;
-      return [cx + R * sx * f * Math.cos(a), memCy + R * sy * f * Math.sin(a)];
+      return [cx + R * sxf * f * Math.cos(a), cy + R * syf * f * Math.sin(a)];
     };
 
-    // aura membrane
+    // membrane → halo
+    ctx.globalAlpha = 1 - 0.75 * hf;
     ctx.beginPath();
     for (let i = 0; i <= 160; i++) {
       const [x, y] = memXY(TAU * i / 160);
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     }
-    ctx.lineWidth = 2; ctx.stroke();
+    ctx.lineWidth = 2; ctx.strokeStyle = hx.primary; ctx.stroke();
     ctx.fillStyle = hx.primary + "10"; ctx.fill();
+    ctx.globalAlpha = 1;
 
-    // cilia fade away as the organism outgrows them
+    // cilia fade as it outgrows them
     ctx.strokeStyle = hx.secondary + "aa"; ctx.lineWidth = 1;
-    const nCil = Math.floor(26 * (1 - mph));
+    const nCil = Math.floor(26 * Math.max(0, 1 - mph / 0.35));
     for (let k = 0; k < nCil; k++) {
       const a = TAU * k / Math.max(1, nCil) + 0.12 * Math.sin(t * 0.7 + k);
-      const sway = 0.55 * Math.sin(t * 2.1 + k * 1.9 + hash(k) * TAU);
+      const sw = 0.55 * Math.sin(t * 2.1 + k * 1.9 + hash(k) * TAU);
       const ln = 5 + 6 * hash(k * 3.3);
       const [x0, y0] = memXY(a);
-      const [x1, y1] = memXY(a + sway * 0.03, 1 + ln / R);
+      const [x1, y1] = memXY(a + sw * 0.03, 1 + ln / R);
       ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
     }
 
-    // skeleton (body units: ~1.5 tall, y down)
-    const swayB = (0.04 * Math.sin(t * 0.31) + 0.02 * Math.sin(t * 0.53)) * mph;
-    const breathe = 1 + 0.015 * Math.sin(t * 0.8 + Math.sin(t * 0.13));
-    const lean = 0.03 * Math.sin(t * 0.23) * mph;
-    const P = p => [cx + p[0] * S, memCy + p[1] * S];
-    const trunk = 0.55 * mT * breathe;
-    const pelvis = [swayB, 0.18];
-    const neck = [swayB + lean, pelvis[1] - trunk];
-    const headC = [neck[0] + lean * 0.5, neck[1] - 0.16 * mT];
-    const shw = 0.17 * (0.4 + 0.6 * mT), hipw = 0.10 * (0.5 + 0.5 * mT);
-    const shL = [neck[0] - shw, neck[1] + 0.02], shR = [neck[0] + shw, neck[1] + 0.02];
-    const hipL = [pelvis[0] - hipw, pelvis[1]], hipR = [pelvis[0] + hipw, pelvis[1]];
-    const bones = [[pelvis, neck, 0.085], [shL, shR, 0.05], [hipL, hipR, 0.06]];
-    for (const [s, sh] of [[-1, shL], [1, shR]]) {
-      const el = [sh[0] + s * (0.10 + 0.03 * Math.sin(t * 0.42 + s)) * mL, sh[1] + 0.22 * mL];
-      const ha = [el[0] + s * (0.03 + 0.03 * Math.sin(t * 0.66 + 2 * s)) * mL, el[1] + 0.22 * mL];
-      bones.push([sh, el, 0.05], [el, ha, 0.04]);
-    }
-    for (const [s, hip] of [[-1, hipL], [1, hipR]]) {
-      const kn = [hip[0] + s * 0.02 * mL + 0.02 * Math.sin(t * 0.5 + s) * mL, hip[1] + 0.30 * mL];
-      const ft = [kn[0] + s * 0.03 * mL, kn[1] + 0.32 * mL];
-      bones.push([hip, kn, 0.06], [kn, ft, 0.05]);
-    }
-    if (mph > 0.35) {
-      ctx.strokeStyle = hx.secondary + "44"; ctx.lineWidth = 1.5;
-      for (const [p0, p1] of bones) {
-        const [x0, y0] = P(p0), [x1, y1] = P(p1);
-        ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    // anatomy: classical 7.5-head proportions (head-units, y down from crown)
+    const STAND = { head:[0,0.5], neck:[0,1.2], chest:[0,2.0], pelvis:[0,3.7],
+      shL:[-0.80,1.5], shR:[0.80,1.5], elL:[-1.02,2.85], elR:[1.02,2.85],
+      wrL:[-1.12,3.90], wrR:[1.12,3.90], hipL:[-0.48,3.85], hipR:[0.48,3.85],
+      knL:[-0.55,5.50], knR:[0.55,5.50], anL:[-0.60,7.25], anR:[0.60,7.25],
+      ftL:[-0.90,7.40], ftR:[0.90,7.40] };
+    const FETAL = { head:[-0.67,2.55], neck:[-0.27,3.05], chest:[0.18,3.45], pelvis:[0.78,4.10],
+      shL:[-0.37,3.30], shR:[-0.17,2.80], elL:[-0.72,3.60], elR:[-0.52,3.20],
+      wrL:[-0.87,3.15], wrR:[-0.77,2.80], hipL:[0.63,4.25], hipR:[0.88,3.95],
+      knL:[-0.07,4.40], knR:[0.13,4.10], anL:[-0.37,4.90], anR:[-0.17,4.65],
+      ftL:[-0.72,4.95], ftR:[-0.52,4.70] };
+
+    const sBr = 0.5 + 0.5 * Math.sin(TAU * t / 6.5 + 0.6 * Math.sin(t * 0.13));
+    const ws = 0.12 * Math.sin(t * 0.19) * uSt;
+    const bob = 0.08 * Math.sin(t * 0.45) * (1 - uSt);
+    const UPPER = new Set(["head","neck","chest","shL","shR","elL","elR","wrL","wrR"]);
+    const J = {};
+    let ki = 0;
+    for (const k in STAND) {
+      const f = FETAL[k], sp = STAND[k];
+      let x = f[0] + (sp[0] - f[0]) * uSt;
+      let y = f[1] + (sp[1] - f[1]) * uSt + bob;
+      if (UPPER.has(k)) { y -= 0.045 * sBr; x += ws * 0.4; }
+      if (k === "head") x += ws * -0.25 + 0.02 * Math.sin(t * 0.6);
+      if (k === "pelvis" || k === "hipL" || k === "hipR") x += ws;
+      if (k === "knL" || k === "knR") x += ws * 0.35;
+      if (k === "elL" || k === "wrL") x += 0.05 * Math.sin(t * 0.50) * uSt;
+      if (k === "elR" || k === "wrR") x += 0.05 * Math.sin(t * 0.50 + 2.6) * uSt;
+      if (uSt < 0.5 && ["wrL","wrR","ftL","ftR","knL","knR"].includes(k)) {
+        const tw = Math.max(0, Math.sin(t * 0.83 + hash(ki) * TAU)) ** 9;
+        x += tw * 0.12 * (1 - uSt); y += tw * 0.08 * (1 - uSt);
       }
+      J[k] = [x, y]; ki++;
+    }
+    const P = p => [cx + p[0] * S, cy + (p[1] - 3.75) * S];
+    const chub = 1.55 - 0.55 * uSt;
+    const CAPS = [
+      ["neck","head",0.22,0.19], ["neck","pelvis",0.62,0.42], ["shL","shR",0.22,0.22],
+      ["shL","elL",0.17,0.13], ["elL","wrL",0.13,0.10],
+      ["shR","elR",0.17,0.13], ["elR","wrR",0.13,0.10],
+      ["hipL","knL",0.26,0.17], ["knL","anL",0.17,0.11],
+      ["hipR","knR",0.26,0.17], ["knR","anR",0.17,0.11],
+      ["anL","ftL",0.12,0.10], ["anR","ftR",0.12,0.10]];
+
+    if (be > 0.01) {
+      ctx.globalAlpha = be;
+      for (const [k0, k1, r0, r1] of CAPS) {
+        const [x0, y0] = P(J[k0]), [x1, y1] = P(J[k1]);
+        const dx = x1 - x0, dy = y1 - y0;
+        const ln = Math.sqrt(dx * dx + dy * dy) || 1e-6;
+        const nx = -dy / ln, ny = dx / ln;
+        const pr0 = r0 * chub * S, pr1 = r1 * chub * S;
+        ctx.beginPath();
+        ctx.moveTo(x0 + nx * pr0, y0 + ny * pr0);
+        ctx.lineTo(x1 + nx * pr1, y1 + ny * pr1);
+        ctx.arc(x1, y1, pr1, Math.atan2(ny, nx), Math.atan2(-ny, -nx));
+        ctx.lineTo(x0 - nx * pr0, y0 - ny * pr0);
+        ctx.arc(x0, y0, pr0, Math.atan2(-ny, -nx), Math.atan2(ny, nx));
+        ctx.closePath();
+        ctx.fillStyle = hx.primary + "1c"; ctx.fill();
+        ctx.lineWidth = 1.5; ctx.strokeStyle = hx.primary + "cc"; ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
     }
 
-    // nucleus → head: migrates up, rounds off, becomes the mind
+    // ground shadow once it stands
+    if (hf > 0.2) {
+      const gy = P([0, 7.55])[1];
+      ctx.globalAlpha = 0.35 * hf;
+      ctx.fillStyle = hx.secondary;
+      ctx.beginPath(); ctx.ellipse(cx + ws * S, gy, 1.35 * S, 0.16 * S, 0, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // nucleus → head
     const wx = cx + R * 0.20 * (Math.sin(t * 0.23 + 1.1) + 0.5 * Math.sin(t * 0.111 + 4.2));
-    const wy = memCy + R * 0.16 * (Math.sin(t * 0.17) + 0.5 * Math.sin(t * 0.087 + 2.6));
-    const [hpx, hpy] = P(headC);
+    const wy = cy + R * 0.16 * (Math.sin(t * 0.17) + 0.5 * Math.sin(t * 0.087 + 2.6));
+    const [hpx, hpy] = P(J.head);
     const ncx = wx + (hpx - wx) * mh, ncy = wy + (hpy - wy) * mh;
-    const nr = (1 - mh) * 0.24 * R + mh * 0.13 * S;
-    const namp = 1 - 0.65 * mh;
+    const nr = (1 - mh) * 0.24 * R + mh * 0.5 * S * chub;
+    const namp = 1 - 0.72 * mh;
     const nucR = a => nr * (1
       + namp * 0.18 * Math.sin(2 * a - t * 0.74 + 2.3)
       + namp * 0.12 * Math.sin(3 * a + t * 1.07)
@@ -336,30 +386,30 @@ function core(ctx, t, cx, cy, R, gpu, hx) {
     ctx.beginPath();
     for (let i = 0; i <= 60; i++) {
       const a = TAU * i / 60, r = nucR(a);
-      const x = ncx + r * Math.cos(a), y = ncy + r * Math.sin(a);
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      i === 0 ? ctx.moveTo(ncx + r, ncy) : ctx.lineTo(ncx + r * Math.cos(a), ncy + r * Math.sin(a));
     }
     ctx.fill();
 
-    // particles migrate: cytoplasm swirl → flesh on the skeleton
+    // particles migrate: cytoplasm → flesh inside the capsules
     const nCyt = 70 + 150 * den;
     for (let i = 0; i < nCyt; i++) {
       const h1 = hash(i * 1.9), h2 = hash(i * 5.3);
       const h3 = hash(i * 7.7), h4 = hash(i * 3.7);
-      const wgt = Math.max(0, Math.min(1, (mph - 0.30 - 0.45 * h3) / 0.22));
+      const wgt = Math.max(0, Math.min(1, (mph - 0.30 - 0.40 * h3) / 0.20));
       const w = 0.06 + 0.22 * h2;
       const a = TAU * h1 + t * w * (1 + 0.35 * Math.sin(t * 0.21 + i));
       const frac = 0.30 + 0.62 * (h2 ** 0.7) + 0.05 * Math.sin(t * 0.6 + i * 2.2);
       const [cxp, cyp] = memXY(a, Math.min(0.93, frac));
       let x = cxp, y = cyp;
       if (wgt > 0) {
-        const bone = bones[Math.floor(h1 * bones.length) % bones.length];
-        const [p0, p1, bw] = bone;
+        const [k0, k1, r0, r1] = CAPS[Math.floor(h1 * CAPS.length) % CAPS.length];
+        const p0 = J[k0], p1 = J[k1];
         const u = h2;
         const bxu = p0[0] + (p1[0] - p0[0]) * u, byu = p0[1] + (p1[1] - p0[1]) * u;
         const dx = p1[0] - p0[0], dy = p1[1] - p0[1];
-        const ln = Math.sqrt(dx * dx + dy * dy) || 1;
-        const off = bw * (h4 * 2 - 1) * (1 + 0.15 * Math.sin(t * 0.9 + i));
+        const ln = Math.sqrt(dx * dx + dy * dy) || 1e-6;
+        const r = (r0 + (r1 - r0) * u) * chub;
+        const off = r * (h4 * 2 - 1) * (0.85 + 0.15 * Math.sin(t * 0.9 + i));
         const [fx, fy] = P([bxu - dy / ln * off, byu + dx / ln * off]);
         x = cxp + (fx - cxp) * wgt; y = cyp + (fy - cyp) * wgt;
       }

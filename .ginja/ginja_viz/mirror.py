@@ -220,19 +220,25 @@ class MirrorScene:
         b, m = self.bright, self.mid
 
         if shape == "cell":
-            # ── a lifeform that EVOLVES: cell → elongation → limb buds → human ──
-            # morph m ∈ [0,1]: replays development each session, capped by the
-            # brain's real phase (newborn stays a cell; mature becomes humanoid)
+            # ── ontogeny, done properly: cell → curled fetus → standing human ──
+            # m ∈ [0,1] replays development each session, capped by real phase.
             mph = self._m
-            mT = mph                                          # trunk/elongation
-            mL = max(0.0, min(1.0, (mph - 0.45) / 0.55))      # limb growth
-            mh = max(0.0, min(1.0, (mph - 0.50) / 0.35))      # nucleus → head
+            smooth = lambda x: 0.0 if x <= 0 else 1.0 if x >= 1 else x * x * (3 - 2 * x)
+            be = smooth((mph - 0.35) / 0.20)     # body emergence (fetus fades in)
+            u_st = smooth((mph - 0.52) / 0.40)   # pose: 0 fetal, 1 standing
+            mh = smooth((mph - 0.35) / 0.25)     # nucleus → head
+            hf = smooth((mph - 0.82) / 0.18)     # membrane → faint halo
 
-            # aura/membrane: the amoeba wall stretches tall and calms as it grows
+            # ── figure scale: embryo lives inside the cell, adult fills the frame ──
+            s_full = 0.86 * self.H / (7.5 * self.aspect)   # px per head-unit
+            s_emb = 0.5 * R
+            s = s_emb + (s_full - s_emb) * smooth((mph - 0.38) / 0.62)
+
+            # ── membrane / amniotic sac / halo ──
             amp = 1.0 - 0.55 * mph
-            sx = 1.0 - 0.32 * mph
-            sy = 1.0 + 0.62 * mph
-            mem_cy = cy + 0.07 * R * 1.55 * self.aspect * mph
+            sm = smooth((mph - 0.35) / 0.50)
+            sx = 1.0 + (max(0.5, 1.65 * s / R) - 1.0) * sm
+            sy = 1.0 + (max(1.0, 4.05 * s / R) - 1.0) * sm
 
             def membrane_r(a):
                 return (1.0
@@ -244,73 +250,133 @@ class MirrorScene:
             def mem_xy(a, frac=1.0):
                 f = membrane_r(a) * frac
                 return (cx + R * sx * f * math.cos(a),
-                        mem_cy + R * sy * f * math.sin(a) * self.aspect)
+                        cy + R * sy * f * math.sin(a) * self.aspect)
 
-            n_mem = int(140 + 160 * density)
+            n_mem = int((140 + 160 * density) * (1.0 - 0.72 * hf))
             for i in range(n_mem):
-                a = TAU * i / n_mem
+                a = TAU * i / max(1, n_mem)
                 x, y = mem_xy(a)
-                b.plot(int(x), int(y))
-                if i % 2 == 0:
+                (m if hf > 0.3 else b).plot(int(x), int(y))
+                if i % 2 == 0 and hf < 0.5:
                     x2, y2 = mem_xy(a, 0.97)
                     m.plot(int(x2), int(y2))
 
-            # cilia fade away as the organism outgrows them
-            n_cil = int(26 * (1.0 - mph))
+            n_cil = int(26 * max(0.0, 1.0 - mph / 0.35))
             for k in range(n_cil):
                 a = TAU * k / max(1, n_cil) + 0.12 * math.sin(t * 0.7 + k)
-                sway = 0.55 * math.sin(t * 2.1 + k * 1.9 + _hash(k) * TAU)
+                sway_c = 0.55 * math.sin(t * 2.1 + k * 1.9 + _hash(k) * TAU)
                 ln = 2.5 + 2.5 * _hash(k * 3.3)
                 x0, y0 = mem_xy(a)
-                x1, y1 = mem_xy(a + sway * 0.03, 1.0 + ln / R)
+                x1, y1 = mem_xy(a + sway_c * 0.03, 1.0 + ln / R)
                 m.line(x0, y0, x1, y1)
 
-            # ── skeleton (body units: x right, y down, ~1.5 units tall) ──
-            S = R * 1.55
-            sway = (0.04 * math.sin(t * 0.31) + 0.02 * math.sin(t * 0.53)) * mph
-            breathe = 1 + 0.015 * math.sin(t * 0.8 + math.sin(t * 0.13))
-            lean = 0.03 * math.sin(t * 0.23) * mph
+            # ── anatomy: classical 7.5-head proportions, joints in head-units ──
+            STAND = {
+                "head": (0.0, 0.5), "neck": (0.0, 1.2), "chest": (0.0, 2.0),
+                "pelvis": (0.0, 3.7),
+                "shL": (-0.80, 1.5), "shR": (0.80, 1.5),
+                "elL": (-1.02, 2.85), "elR": (1.02, 2.85),
+                "wrL": (-1.12, 3.90), "wrR": (1.12, 3.90),
+                "hipL": (-0.48, 3.85), "hipR": (0.48, 3.85),
+                "knL": (-0.55, 5.50), "knR": (0.55, 5.50),
+                "anL": (-0.60, 7.25), "anR": (0.60, 7.25),
+                "ftL": (-0.90, 7.40), "ftR": (0.90, 7.40),
+            }
+            FETAL = {
+                "head": (-0.67, 2.55), "neck": (-0.27, 3.05), "chest": (0.18, 3.45),
+                "pelvis": (0.78, 4.10),
+                "shL": (-0.37, 3.30), "shR": (-0.17, 2.80),
+                "elL": (-0.72, 3.60), "elR": (-0.52, 3.20),
+                "wrL": (-0.87, 3.15), "wrR": (-0.77, 2.80),
+                "hipL": (0.63, 4.25), "hipR": (0.88, 3.95),
+                "knL": (-0.07, 4.40), "knR": (0.13, 4.10),
+                "anL": (-0.37, 4.90), "anR": (-0.17, 4.65),
+                "ftL": (-0.72, 4.95), "ftR": (-0.52, 4.70),
+            }
+            # motion: breath, weight shift, arm sway, fetal twitches — all layered
+            s_br = 0.5 + 0.5 * math.sin(TAU * t / 6.5 + 0.6 * math.sin(t * 0.13))
+            ws = 0.12 * math.sin(t * 0.19) * u_st
+            bob = 0.08 * math.sin(t * 0.45) * (1 - u_st)
+            J = {}
+            for k in STAND:
+                fx, fy = FETAL[k]
+                sx_, sy_ = STAND[k]
+                x = fx + (sx_ - fx) * u_st
+                y = fy + (sy_ - fy) * u_st + bob
+                if k in ("head", "neck", "chest", "shL", "shR", "elL", "elR", "wrL", "wrR"):
+                    y -= 0.045 * s_br
+                    x += ws * 0.4
+                if k == "head":
+                    x += ws * -0.25 + 0.02 * math.sin(t * 0.6)
+                if k in ("pelvis", "hipL", "hipR"):
+                    x += ws
+                if k in ("knL", "knR"):
+                    x += ws * 0.35
+                if k in ("elL", "wrL"):
+                    x += 0.05 * math.sin(t * 0.50) * u_st
+                if k in ("elR", "wrR"):
+                    x += 0.05 * math.sin(t * 0.50 + 2.6) * u_st
+                if u_st < 0.5 and k in ("wrL", "wrR", "ftL", "ftR", "knL", "knR"):
+                    tw = max(0.0, math.sin(t * 0.83 + _hash(hash(k) % 97) * TAU)) ** 9
+                    x += tw * 0.12 * (1 - u_st)
+                    y += tw * 0.08 * (1 - u_st)
+                J[k] = (x, y)
 
             def P(pt):
-                return (cx + pt[0] * S, mem_cy + pt[1] * S * self.aspect)
+                # body space (head-units, figure centered at (0, 3.75)) → pixels
+                return (cx + pt[0] * s, cy + (pt[1] - 3.75) * s * self.aspect)
 
-            trunk = 0.55 * mT * breathe
-            pelvis = (sway, 0.18)
-            neck = (sway + lean, pelvis[1] - trunk)
-            head_c = (neck[0] + lean * 0.5, neck[1] - 0.16 * mT)
-            shw = 0.17 * (0.4 + 0.6 * mT)
-            hipw = 0.10 * (0.5 + 0.5 * mT)
-            shL = (neck[0] - shw, neck[1] + 0.02)
-            shR = (neck[0] + shw, neck[1] + 0.02)
-            hipL = (pelvis[0] - hipw, pelvis[1])
-            hipR = (pelvis[0] + hipw, pelvis[1])
-            bones = [(pelvis, neck, 0.085), (shL, shR, 0.05), (hipL, hipR, 0.06)]
-            for s, sh in ((-1, shL), (1, shR)):
-                el = (sh[0] + s * (0.10 + 0.03 * math.sin(t * 0.42 + s)) * mL,
-                      sh[1] + 0.22 * mL)
-                ha = (el[0] + s * (0.03 + 0.03 * math.sin(t * 0.66 + 2 * s)) * mL,
-                      el[1] + 0.22 * mL)
-                bones += [(sh, el, 0.05), (el, ha, 0.04)]
-            for s, hip in ((-1, hipL), (1, hipR)):
-                kn = (hip[0] + s * 0.02 * mL + 0.02 * math.sin(t * 0.5 + s) * mL,
-                      hip[1] + 0.30 * mL)
-                ft = (kn[0] + s * 0.03 * mL, kn[1] + 0.32 * mL)
-                bones += [(hip, kn, 0.06), (kn, ft, 0.05)]
+            chub = 1.55 - 0.55 * u_st   # fetuses are round; adults taper
+            CAPS = [
+                ("neck", "head", 0.22, 0.19),
+                ("neck", "pelvis", 0.62, 0.42),
+                ("shL", "shR", 0.22, 0.22),
+                ("shL", "elL", 0.17, 0.13), ("elL", "wrL", 0.13, 0.10),
+                ("shR", "elR", 0.17, 0.13), ("elR", "wrR", 0.13, 0.10),
+                ("hipL", "knL", 0.26, 0.17), ("knL", "anL", 0.17, 0.11),
+                ("hipR", "knR", 0.26, 0.17), ("knR", "anR", 0.17, 0.11),
+                ("anL", "ftL", 0.12, 0.10), ("anR", "ftR", 0.12, 0.10),
+            ]
 
-            if mph > 0.35:
-                for p0, p1, _w in bones:
-                    x0, y0 = P(p0)
-                    x1, y1 = P(p1)
-                    self.dim.line(x0, y0, x1, y1)
+            if be > 0.01:
+                for ci, (k0, k1, r0, r1) in enumerate(CAPS):
+                    p0, p1 = J[k0], J[k1]
+                    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+                    ln = math.sqrt(dx * dx + dy * dy) or 1e-6
+                    nxu, nyu = -dy / ln, dx / ln
+                    steps = max(2, int(ln * s / 1.6))
+                    for kk in range(steps + 1):
+                        u = kk / steps
+                        if _hash(ci * 131 + kk * 7.7) > be:
+                            continue
+                        r = (r0 + (r1 - r0) * u) * chub
+                        bxu = p0[0] + dx * u
+                        byu = p0[1] + dy * u
+                        for sgn in (-1, 1):
+                            x, y = P((bxu + nxu * r * sgn, byu + nyu * r * sgn))
+                            b.plot(int(x), int(y))
+                        if kk % 2 == 0:
+                            off = (_hash(ci * 57 + kk * 3.1 + math.floor(t * 2)) * 2 - 1) * r * 0.8
+                            x, y = P((bxu + nxu * off, byu + nyu * off))
+                            m.plot(int(x), int(y))
 
-            # ── nucleus → head: migrates up, rounds off, becomes the mind ──
+            # ground shadow once it stands
+            if hf > 0.2:
+                gy = P((0, 7.55))[1]
+                grx = 1.35 * s
+                for i in range(int(20 * hf)):
+                    a = TAU * i / max(1, int(20 * hf))
+                    self.dim.plot(int(cx + ws * s + grx * math.cos(a)),
+                                  int(gy + grx * 0.14 * math.sin(a) * self.aspect))
+
+            # ── nucleus → head: wanders as a cell, becomes the mind ──
             wx = cx + R * 0.20 * (math.sin(t * 0.23 + 1.1) + 0.5 * math.sin(t * 0.111 + 4.2))
-            wy = mem_cy + R * 0.16 * (math.sin(t * 0.17) + 0.5 * math.sin(t * 0.087 + 2.6)) * self.aspect
-            hx_px, hy_px = P(head_c)
+            wy = cy + R * 0.16 * (math.sin(t * 0.17) + 0.5 * math.sin(t * 0.087 + 2.6)) * self.aspect
+            hx_px, hy_px = P(J["head"])
             ncx = wx + (hx_px - wx) * mh
             ncy = wy + (hy_px - wy) * mh
-            nr = (1 - mh) * 0.24 * R + mh * 0.13 * S
-            namp = 1.0 - 0.65 * mh
+            nr = (1 - mh) * 0.24 * R + mh * 0.5 * s * chub
+            namp = 1.0 - 0.72 * mh
 
             def nucleus_r(a):
                 return nr * (1.0
@@ -322,20 +388,19 @@ class MirrorScene:
                 a = TAU * i / n_wall
                 x, y = self._xy(ncx, ncy, nucleus_r(a), a)
                 b.plot(int(x), int(y))
-            n_nuc = int(40 + 60 * density)
+            n_nuc = int(30 + 50 * density)
             for i in range(n_nuc):
                 a = TAU * _hash(i * 4.1) + t * 0.07
                 rr = nucleus_r(a) * (_hash(i * 2.7) ** 0.6)
                 x, y = self._xy(ncx, ncy, rr, a)
                 (b if rr > nr * 0.7 else m).plot(int(x), int(y))
 
-            # ── particles migrate: cytoplasm swirl → flesh on the skeleton ──
+            # ── particles migrate: cytoplasm swirl → flesh inside the capsules ──
             n_cyt = int(70 + 150 * density)
             for i in range(n_cyt):
                 h1, h2 = _hash(i * 1.9), _hash(i * 5.3)
                 h3, h4 = _hash(i * 7.7), _hash(i * 3.7)
-                wgt = max(0.0, min(1.0, (mph - 0.30 - 0.45 * h3) / 0.22))
-                # cytoplasm position (amoeba interior)
+                wgt = max(0.0, min(1.0, (mph - 0.30 - 0.40 * h3) / 0.20))
                 w = 0.06 + 0.22 * h2
                 a = TAU * h1 + t * w * (1 + 0.35 * math.sin(t * 0.21 + i))
                 frac = 0.30 + 0.62 * (h2 ** 0.7) + 0.05 * math.sin(t * 0.6 + i * 2.2)
@@ -343,16 +408,16 @@ class MirrorScene:
                 if wgt <= 0.0:
                     m.plot(int(cxp), int(cyp))
                     continue
-                # flesh position: a point along a bone + breathing-shimmer offset
-                bone = bones[int(h1 * len(bones)) % len(bones)]
-                (p0, p1, bw) = bone
+                k0, k1, r0, r1 = CAPS[int(h1 * len(CAPS)) % len(CAPS)]
+                p0, p1 = J[k0], J[k1]
                 u = h2
-                bx = p0[0] + (p1[0] - p0[0]) * u
-                by = p0[1] + (p1[1] - p0[1]) * u
+                bxu = p0[0] + (p1[0] - p0[0]) * u
+                byu = p0[1] + (p1[1] - p0[1]) * u
                 dx, dy = p1[0] - p0[0], p1[1] - p0[1]
-                ln = math.sqrt(dx * dx + dy * dy) or 1.0
-                off = bw * (h4 * 2 - 1) * (1.0 + 0.15 * math.sin(t * 0.9 + i))
-                fx, fy = P((bx - dy / ln * off, by + dx / ln * off))
+                ln = math.sqrt(dx * dx + dy * dy) or 1e-6
+                r = (r0 + (r1 - r0) * u) * chub
+                off = r * (h4 * 2 - 1) * (0.85 + 0.15 * math.sin(t * 0.9 + i))
+                fx, fy = P((bxu - dy / ln * off, byu + dx / ln * off))
                 x = cxp + (fx - cxp) * wgt
                 y = cyp + (fy - cyp) * wgt
                 m.plot(int(x), int(y))
