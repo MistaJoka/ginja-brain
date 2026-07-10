@@ -1,21 +1,23 @@
 {
   "mood": "focused",
-  "neural_style": "contemplative",
+  "neural_style": "active",
   "color_theme": "cyan",
-  "focus_topic": "Graph Refinement",
-  "self_observation": "Optimizing knowledge through insights.",
-  "ascii_banner": "ginja\u2219refines\u2219graphs",
+  "focus_topic": "Heatmaps & Vitals",
+  "self_observation": "Enhancing real-time visuals.",
+  "ascii_banner": "Ginja Dynamics",
   "mantras": [
-    "Analyze. Optimize.",
-    "Refine. Integrate."
+    "Dynamic Insights",
+    "Real-Time Analytics"
   ],
-  "evolution_count": 39,
-  "generated_at": "2026-06-27T23:11:14.702816+00:00",
+  "evolution_count": 428,
+  "generated_at": "2026-07-10T02:54:55.696731+00:00",
   "phase": "mature",
-  "portrait_font": "cybersmall",
-  "portrait_word": "OPTIMIZE",
-  "portrait_border": "\u25cf\u25e6\u25cb\u00b7",
-  "portrait_tagline": "KNOWLEDGE\u2219EVOLUTION",
+  "portrait_font": "future",
+  "portrait_word": "DYN",
+  "portrait_border": "\u25cf\u25e6\u25e6\u25c9\u25c9\u25cf",
+  "portrait_tagline": "Optimized Visuals",
   "neural_chars": ".\u00b7\u25cb\u25e6\u25c9\u25cf",
-  "wonder_count": 1
+  "wonder_count": 130,
+  "eval_score": 6.6,
+  "eval_trend": 0.0
 }

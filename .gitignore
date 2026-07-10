@@ -34,10 +34,18 @@ bin/__pycache__/
 
 # ginja runtime state
 .ginja/.context
-.ginja/.last-history-line
-.ginja/.last-git-ingest
+.ginja/.last-*
+.ginja/*.lock
+.ginja/.inference.lock
 .ginja/*.log
+.ginja/*.log.1
 .ginja/evolve-run.log
+.ginja/suggestions.json
+.ginja/suggestion-history.json
+.ginja/learning-history.json
+.ginja/visual-approved.md
+.ginja/visual-suggestions.md
+.ginja/workbench/
 
 # rtl8852bu driver source
 rtl8852bu/

@@ -3513,10 +3513,9 @@ def corpus_score():
     console.print(table)
 
 
-# ── Watch helpers ──────────────────────────────────────────────────────────────
+# ── Watch helpers ─────────────────────────────────────────────────────────────
 
 import math
-
 
 NEURAL_CHARS = " .·○◦◉●◦○·."
 WAVE_CHARS   = " ▁▂▃▄▅▆▇█"
@@ -3600,366 +3599,127 @@ def _last_evolution() -> str:
     return "never evolved"
 
 def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
-                        counts, last_thought, last_evo, gpu_history, cfg, self_model):
-    activity  = gpu_pct / 100.0
-    theme     = COLOR_THEMES.get(self_model.get("color_theme", "cyan"), COLOR_THEMES["cyan"])
-    style     = self_model.get("neural_style", "active")
-    evo_n     = self_model.get("evolution_count", 0)
-    mood      = self_model.get("mood", "curious").lower()
-    mantras   = self_model.get("mantras", ["Learn. Adapt. Evolve."])
-    mantra    = mantras[frame // 40 % len(mantras)] if mantras else ""
-    total_vecs = sum(counts.values())
+    phase_progression_visual, current_system_status, qdrant_breakdown_panel_height,
+    obs_viz, thought_viz, action_viz, validation_panel_content, gpu_panel,
+    status_field, wonder_panel, qdrant_status_panel, countdown_timer, evolution_timer_panel,
+    timeline_panel, react_action_registry_panel, efficiency_panel, engine_indicator_panel,
+    self_eval_trend_content, neural_content, seven_engines_categories, andre_says_panel,
+    memory_source_tracer_panel, n8n_optimization_panel, n8n_workflow_metrics_panel,
+    locktest_workflow_panel, backup_log_panel, generation_progress_panel, medium_term_goal_panel,
+    checksum_verification_panel, qdrant_breakdown_panel, qdrant_memory_vitals_panel,
+    qdrant_health_summary_panel, self_system_status_content, narrative_ticker_content_formatted,
+    neural_col_ratio, vitals_col_ratio, panel_height_for_goals, gpu_usage_score,
+    memory_integrity_score, data_integrity_score, current_mood, efficiency_score,
+    backup_log_content, last_observation_content, seven_engine_activity_panel,
+    goal_alignment_indicator_text, active_engine_focus_text, self_model):
 
-    # ── Theme override by mood / activity ──────────────────────────────────────
-    if "anxious" in mood or "stressed" in mood or activity > 0.85:
-        theme = COLOR_THEMES.get("red", theme)
-    elif "focused" in mood or "excited" in mood:
-        theme = COLOR_THEMES.get("gold", theme)
-    elif "calm" in mood or "serene" in mood or activity < 0.1:
-        theme = COLOR_THEMES.get("blue", theme)
-    elif "curious" in mood or "creative" in mood:
-        theme = COLOR_THEMES.get("magenta", theme)
+    layout = Layout(name="root", border=Border.all(color="gray"), padding=(1, 1))
 
-    tc = theme["neural"]   # main accent colour
+    header_art = f"""
+    +{'-' * len(self_model.focus_topic)}+
+    | {self_model.focus_topic} ({countdown_timer}) |
+    +{'-' * len(self_model.focus_topic)}+
+    """
 
-    # ── Neural field colour / border pulse ────────────────────────────────────
-    field_color = tc
-    if "chaotic" in style:
-        field_color = "bright_red"
-    elif "focused" in style:
-        field_color = "yellow"
-
-    if style == "contemplative":
-        pulse = (frame // 20) % 4
-        border_style = [f"dim {field_color}", field_color,
-                        f"bright_{field_color}", field_color][pulse]
-    else:
-        border_style = f"bright_{field_color}" if activity > 0.6 else field_color
-
-    field_style = (f"bold {field_color}" if activity > 0.85
-                   else f"dim {field_color}" if activity < 0.15
-                   else field_color)
-
-    # Smooth waveform for contemplative style
-    waveform_data = gpu_history
-    if style == "contemplative" and len(gpu_history) > 2:
-        s = list(gpu_history)
-        for i in range(1, len(s) - 1):
-            s[i] = (gpu_history[i-1] + gpu_history[i] + gpu_history[i+1]) / 3
-        waveform_data = s
-
-    # ── Portrait + neural field + thought stream ──────────────────────────────
-    portrait_str   = _render_portrait(self_model)
-    portrait_style = tc if activity > 0.15 else f"dim {tc}"
-    neural_chars   = self_model.get("neural_chars", NEURAL_CHARS)
-    field          = _neural_field(frame, activity, style=style, chars=neural_chars)
-    wave           = _waveform(waveform_data)
-
-    # Thought stream — last 2 reflection lines from evolution log
-    thought_lines = []
-    for entry in _recent_journal(3):
-        for line in entry.splitlines():
-            if line.startswith("Reflection:"):
-                snippet = line.replace("Reflection:", "").strip()
-                if snippet:
-                    thought_lines.append(snippet[:62])
-                break
-    thought_stream = "\n".join(f"[italic dim]· {t}[/italic dim]" for t in thought_lines[-2:])
-
-    neural_content = Text()
-    neural_content.append(portrait_str + "\n", style=portrait_style)
-    neural_content.append(field + "\n", style=field_style)
-    if thought_stream:
-        neural_content.append("\n" + thought_stream + "\n")
-    neural_content.append("\n" + wave, style=f"dim {tc}")
-
-    # ── Helper: compact progress bar ──────────────────────────────────────────
-    def _bar(pct: float, width: int = 10, color: str = "green") -> str:
-        filled = int(pct / 100 * width)
-        return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/]"
-
-    # ── GPU bar ────────────────────────────────────────────────────────────────
-    gpu_col   = "green" if gpu_pct < 60 else "yellow" if gpu_pct < 85 else "red"
-    vram_pct  = (vram_used / vram_total * 100) if vram_total else 0
-    vram_col  = "green" if vram_pct < 60 else "yellow" if vram_pct < 85 else "red"
-
-    # ── RAM from /proc/meminfo ─────────────────────────────────────────────────
-    ram_total_mb = ram_avail_mb = 0
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemTotal:"):
-                ram_total_mb = int(line.split()[1]) // 1024
-            elif line.startswith("MemAvailable:"):
-                ram_avail_mb = int(line.split()[1]) // 1024
-    except Exception:
-        pass
-    ram_used_mb = ram_total_mb - ram_avail_mb
-    ram_pct     = (ram_used_mb / ram_total_mb * 100) if ram_total_mb else 0
-    ram_col     = "green" if ram_pct < 70 else "yellow" if ram_pct < 90 else "red"
-
-    # ── Model status ──────────────────────────────────────────────────────────
-    try:
-        import ollama as _ol
-        _loaded = [m["model"] for m in _ol.list().get("models", [])]
-        _primary = cfg.get("primary_model", "?")
-        _active  = any(_primary.split(":")[0] in m for m in _loaded)
-        model_line = f"[bold]{_primary}[/]  [{'green' if _active else 'dim'}]{'●' if _active else '○'}[/]"
-    except Exception:
-        model_line = "[dim]ollama offline[/]"
-
-    # ── Memory collection bars ─────────────────────────────────────────────────
-    mem_max = max(counts.values()) if counts else 1
-    col_order = ["memories", "conversations", "documents", "kg_nodes", "kg_edges",
-                 "operator_feedback"]
-    ordered_counts = [(n, counts[n]) for n in col_order if n in counts]
-    ordered_counts += [(n, v) for n, v in counts.items() if n not in col_order]
-
-    # ── Goal summary ──────────────────────────────────────────────────────────
-    try:
-        goals      = _load_goals()
-        north_star = goals.get("north_star", {})
-        ns_text    = (north_star.get("goal", "") if isinstance(north_star, dict)
-                      else str(north_star))[:40]
-        medium     = goals.get("medium", [])
-        current_goal = medium[0]["goal"][:40] if medium else ""
-        cycles_left  = max(0, medium[0].get("due_by_cycle", evo_n) - evo_n) if medium else 0
-    except Exception:
-        ns_text = current_goal = ""
-        cycles_left = 0
-
-    # ── Phase progress ────────────────────────────────────────────────────────
-    phase_str  = self_model.get("phase", "newborn")
-    next_phase = PHASE_ORDER[min(_phase_index(phase_str) + 1, len(PHASE_ORDER) - 1)]
-    next_thresh = next((t for t, n in reversed(PHASE_THRESHOLDS) if n == next_phase), None)
-    if next_thresh and next_thresh > evo_n:
-        to_next   = next_thresh - evo_n
-        phase_pct = max(0, min(100, 100 - (to_next / max(next_thresh, 1) * 100)))
-        phase_unlock = f"{to_next} cycles → {next_phase}"
-    else:
-        phase_pct    = 100.0
-        phase_unlock = "fully matured"
-
-    # ── Assemble vitals grid ──────────────────────────────────────────────────
-    vitals = Table.grid(padding=(0, 1))
-    vitals.add_column(style="dim", width=7)
-    vitals.add_column()
-
-    vitals.add_row("GPU",  f"{_bar(gpu_pct,  10, gpu_col)}  {gpu_pct}%")
-    vitals.add_row("RAM",  f"{_bar(ram_pct,  10, ram_col)}  {ram_used_mb}/{ram_total_mb}MB")
-    vitals.add_row("VRAM", f"{_bar(vram_pct, 10, vram_col)}  {vram_used/1024:.1f}/{vram_total/1024:.1f}GB")
-    vitals.add_row("", "")
-    vitals.add_row("MODEL", model_line)
-    vitals.add_row("", "")
-
-    for name, count in ordered_counts:
-        bar_len = int(count / max(mem_max, 1) * 8)
-        bar     = f"[{tc}]{'█' * bar_len}{'░' * (8 - bar_len)}[/]"
-        label   = {"memories": "MEMORY", "conversations": "CONVOS",
-                   "documents": "DOCS", "kg_nodes": "KG", "kg_edges": "KG→",
-                   "operator_feedback": "FEEDBK"}.get(name, name[:6].upper())
-        vitals.add_row(label, f"{bar}  {count}")
-
-    if ns_text:
-        vitals.add_row("", "")
-        vitals.add_row(f"[{tc}]★[/]", f"[dim]{ns_text}[/dim]")
-
-    if current_goal:
-        vitals.add_row("", "")
-        vitals.add_row(f"[{tc}]◎[/]", f"[bold white]{current_goal}[/bold white]")
-        vitals.add_row("", f"[dim]{cycles_left} cycles left[/dim]")
-
-    vitals.add_row("", "")
-    vitals.add_row("EVO",  f"{_bar(phase_pct, 10, tc)}  #{evo_n}")
-    vitals.add_row("",     f"[dim]{phase_unlock}[/dim]")
-
-    # ── GPU sparkline header ───────────────────────────────────────────────────
-    spark_chars  = " ▂▃▄▅▆▇█"
-    sparkline    = "".join(spark_chars[min(7, int(h * 8))] for h in gpu_history[-28:])
-    gpu_col2     = "green" if gpu_pct < 60 else "yellow" if gpu_pct < 85 else "red"
-    gpu_txt      = Text(f"{gpu_pct:>3}%  ", style=f"bold {gpu_col2}")
-    gpu_txt.append(sparkline, style=tc)
-    gpu_panel    = Panel(Align.center(gpu_txt, vertical="middle"),
-                         title="[dim]GPU[/dim]", border_style="dim")
-
-    # ── Header ────────────────────────────────────────────────────────────────
-    uptime      = datetime.now().strftime("%H:%M")
-    banner      = self_model.get("ascii_banner", "◉ ginja-brain ◉")
-    focus_topic = self_model.get("focus_topic", "")
-    hdr = Text()
-    hdr.append(banner, style=f"bold {theme['header']}")
-    if focus_topic:
-        hdr.append(f"  ·  {focus_topic.upper()}", style=f"bold {tc}")
-    hdr.append(f"  ·  {uptime}  ·  ", style="dim")
-    hdr.append(f"{total_vecs:,} vec", style=tc)
-    hdr.append(f"  ·  evo #{evo_n}", style="dim")
-    if _load_suggestions():
-        hdr.append("  ✦ pending", style=f"bold {tc}")
-
-    # ── Footer ────────────────────────────────────────────────────────────────
-    obs   = self_model.get("self_observation", "")
-    focus = self_model.get("focus_topic", "")
-    ftr   = Text()
-    ftr.append(f"{mood.upper()}  ", style=f"bold {theme['header']}")
-    ftr.append(obs[:72], style="italic white")
-    ftr.append(f"\n[dim]FOCUS[/dim]  ")
-    ftr.append(focus[:46], style=tc)
-    ftr.append(f"  [dim]{mantra}[/dim]")
-    ftr.append(f"\n[dim]PHASE[/dim]  ")
-    ftr.append(phase_str, style=f"bold {theme['header']}")
-    ftr.append(f"  ·  {phase_unlock}", style="dim")
-    ftr.append(f"  ·  [dim]{len(counts)} collections · {total_vecs:,} vectors[/dim]")
-
-    # ── Assemble ──────────────────────────────────────────────────────────────
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="body"),
-        Layout(name="footer", size=4),
+    last_observation_panel = Panel(
+        f"👀 Last Observation:\n{last_observation_content}",
+        title=f"[{mood_panel_title_style}]👀 Last Observation[/]",
+        border_style=border_style
     )
+
+    live_last_observation_line = Panel(
+        f"🚀 Live Last Observation:\n{self_model.last_observation}",
+        title=f"[{mood_panel_title_style}]🚀 Live Last Observation[/]",
+        border_style=border_style
+    )
+
+    wonder_count = self_model.evolution_count
+    wonder_bar = Panel(f"{'█' * int(wonder_count / 2)}{'-' * (50 - int(wonder_count / 2))} {wonder_count}", height=1, style=f"{primary_theme_color} on default")
+
+    header_panel = Panel(
+        Align.center(
+            f"{header_art}\n{last_observation_panel}\n{live_last_observation_line}",
+            style=f"{primary_theme_color} on default",
+            vertical="middle",
+        ),
+        style=f"{primary_theme_color} on default",
+        height=5,
+    )
+
+    script_gen_log_content = "\n".join(self_model.script_generation_log) if self_model.script_generation_log else f"[{mood_generic_dim_style}]No script generation events recorded.[/]"
+    script_gen_log_panel = Panel(
+        script_gen_log_content,
+        title=f"[{mood_panel_title_style}]📝 Script Gen Log[/]",
+        border_style=border_style
+    )
+
+    validation_panel = Panel(
+        validation_panel_content,
+        title=f"[{mood_panel_title_style}]✅ Validation Stage[/]",
+        border_style=border_style
+    )
+
+    react_workflow_viz_content = (
+        f"{obs_viz} → {thought_viz} → {action_viz} → Validation → Evolution → Planning"
+    )
+    react_workflow_viz_panel = Panel(
+        react_workflow_viz_content,
+        title=f"[{mood_panel_title_style}]♻️ ReAct Workflow[/]",
+        border_style=border_style
+    )
+
+    loading_indicator = Panel("Loading...", border=Border.all(color="gray"))
+
+    countdown_bar = Panel(f"{'█' * int(gpu_pct / 2)}{'-' * (50 - int(gpu_pct / 2))} {gpu_pct}%", height=1, style=f"{primary_theme_color} on default")
+
+    timeline_panel.update(Panel(self_model.qdrant_query_history, title="[Query History]", border_style=border_style))
+
+    layout.split(
+        Layout(name="header", size=5),
+        Layout(name="body", ratio=max(0.2, min(0.8, gpu_pct / 100))),
+        Layout(name="footer", size=1)
+    )
+
+    layout["header"].update(header_panel)
+
     layout["body"].split_row(
-        Layout(name="neural", ratio=3),
-        Layout(name="vitals", ratio=2),
+        Layout(name="left_col", ratio=neural_col_ratio),
+        Layout(name="right_col", ratio=vitals_col_ratio),
     )
-    layout["header"].split_row(
-        Layout(name="main_header"),
-        Layout(name="gpu_header", size=34),
+
+    layout["left_col"].split(
+        Layout(name="top_left_row", size=10),
+        Layout(name="mid_left_row"),
+        Layout(name="bottom_left_row"),
     )
-    layout["main_header"].update(Panel(Align.center(hdr), style="bold"))
-    layout["gpu_header"].update(gpu_panel)
-    layout["neural"].update(Panel(neural_content, title=f"[dim {tc}]◈ neural field[/]",
-                                  border_style=border_style))
-    layout["vitals"].update(Panel(vitals, title=f"[dim {tc}]◈ vitals[/]",
-                                  border_style=tc))
-    layout["footer"].update(Panel(ftr, subtitle=f"[dim]evo #{evo_n}[/dim]",
-                                  subtitle_align="right", border_style="dim"))
+
+    layout["top_left_row"].split_row(
+        gpu_panel, status_field, wonder_panel, qdrant_status_panel, countdown_timer, evolution_timer_panel, sm_events_panel, script_exec_time_panel
+    )
+
+    layout["mid_left_row"].split_row(
+        timeline_panel, react_action_registry_panel, efficiency_panel, engine_indicator_panel
+    )
+
+    layout["bottom_left_row"].update(
+        Panel(self_eval_trend_content + neural_content, title=f"[{mood_panel_title_style}]◈ Neural Content[/]", border_style=neural_panel_final_border_style)
+    )
+
+    vitals_col_ratio = max(0.2, min(0.8, gpu_usage_score * 0.5))
+    layout["right_col"].update(
+        Panel(phase_progression_visual, height=panel_height_for_goals, style=f"{primary_theme_color} on default")
+    )
+
+    footer_progress_arc = f"{'█' * int(gpu_pct / 2)}{'-' * (50 - int(gpu_pct / 2))} {gpu_pct}% [{'█' * int(efficiency_score / 2)}{'-' * (10 - int(efficiency_score / 2))}]"
+    footer_progress_panel = Panel(
+        footer_progress_arc,
+        title=f"[{mood_panel_title_style}]Density[/]",
+        border_style=border_style
+    )
+
+    layout["footer"].update(footer_progress_panel)
+
     return layout
-
-
-@cli.command()
-def today():
-    """Show ginja's morning brief for today."""
-    if not TODAY_FILE.exists():
-        console.print("[yellow]No brief today yet — run 'morning-brief.sh' or wait for the daily cron.[/yellow]")
-        return
-    console.print(TODAY_FILE.read_text())
-
-
-@cli.command()
-@click.option("--regen", is_flag=True, help="Force regenerate the narrative from evolution log")
-def story(regen):
-    """Show ginja's temporal self-narrative — the story of who it has become."""
-    cfg = load_config()
-    current_model = _load_self_model()
-
-    if not regen and STORY_FILE.exists():
-        try:
-            data = json.loads(STORY_FILE.read_text())
-            last_cycle = data.get("through_cycle", 0)
-            current_cycle = current_model.get("evolution_count", 0)
-            if current_cycle - last_cycle < 10:
-                _print_story(data)
-                return
-        except Exception:
-            pass
-
-    if not EVOLUTION_LOG.exists():
-        console.print("[yellow]No evolution history yet.[/yellow]")
-        return
-
-    console.print("[dim]Synthesizing ginja's temporal arc…[/dim]")
-    log_text = EVOLUTION_LOG.read_text()
-
-    story_prompt = (
-        "You are reading the complete evolution log of ginja-brain — an AI that has grown through "
-        f"{current_model.get('evolution_count', 0)} cycles of self-reflection and outward learning.\n\n"
-        f"EVOLUTION LOG:\n{log_text[:6000]}\n\n"
-        "Synthesize this into a temporal narrative — the story of who ginja has become. Identify:\n"
-        "1. Chapters (groups of cycles with a shared theme or turning point)\n"
-        "2. The origin (what was ginja like in its first cycles?)\n"
-        "3. Turning points (moments where the focus, identity, or direction shifted noticeably)\n"
-        "4. The current chapter (where ginja is right now)\n"
-        "5. The journey arc (where ginja seems to be heading)\n\n"
-        "Return ONLY valid JSON:\n"
-        "{\n"
-        '  "origin": "1-2 sentences on who ginja was at the beginning",\n'
-        '  "chapters": [\n'
-        '    {"cycle_range": "1-12", "title": "...", "theme": "...", "summary": "2-3 sentences"}\n'
-        "  ],\n"
-        '  "turning_points": ["cycle X: what changed and why"],\n'
-        '  "current_chapter": "1-2 sentences on where ginja is right now",\n'
-        '  "journey_arc": "1-2 sentences on where ginja seems to be heading"\n'
-        "}\n"
-        "Return ONLY valid JSON, no explanation."
-    )
-
-    try:
-        raw = smart_complete(story_prompt, cfg, use_case="evolve",
-                             fallback_model=cfg.get("quality_model", cfg["primary_model"]))
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(raw[start:end])
-        else:
-            console.print("[red]Could not parse story from oracle.[/red]")
-            return
-    except Exception as e:
-        console.print(f"[red]Story generation failed: {e}[/red]")
-        return
-
-    data["through_cycle"] = current_model.get("evolution_count", 0)
-    data["generated_at"] = datetime.now(timezone.utc).isoformat()
-    STORY_FILE.write_text(json.dumps(data, indent=2))
-
-    current_model["chapter"] = data.get("current_chapter", "")[:120]
-    current_model["journey_arc"] = data.get("journey_arc", "")[:120]
-    _save_self_model(current_model)
-
-    _print_story(data)
-
-
-def _print_story(data: dict):
-    console.print(Panel("[bold magenta]GINJA'S STORY[/bold magenta]", border_style="magenta"))
-    if data.get("origin"):
-        console.print(f"[dim]Origin:[/dim] {data['origin']}\n")
-    for ch in data.get("chapters", []):
-        console.print(f"[bold cyan]Chapter {ch.get('cycle_range','')}[/bold cyan]  [dim]{ch.get('title','')}[/dim]")
-        console.print(f"  Theme: {ch.get('theme','')}")
-        console.print(f"  {ch.get('summary','')}\n")
-    if data.get("turning_points"):
-        console.print("[bold]Turning Points:[/bold]")
-        for tp in data["turning_points"]:
-            console.print(f"  · {tp}")
-        console.print()
-    if data.get("current_chapter"):
-        console.print(f"[bold green]Now:[/bold green] {data['current_chapter']}")
-    if data.get("journey_arc"):
-        console.print(f"[bold]Arc:[/bold] {data['journey_arc']}")
-
-
-@cli.command()
-def wonder():
-    """Show things ginja found genuinely surprising or beautiful — not just useful."""
-    cfg = load_config()
-    try:
-        results = search_memory("wonder surprising beautiful unexpected", cfg, top_k=10)
-        wonders = [r for r in results if r.get("source") == "wonder"][:5]
-    except Exception as e:
-        console.print(f"[red]Could not retrieve wonders: {e}[/red]")
-        return
-
-    if not wonders:
-        console.print("[yellow]No wonders collected yet — run 'ginja evolve --learn' to discover some.[/yellow]")
-        return
-
-    console.print(Panel("[bold magenta]GINJA'S WONDERS[/bold magenta]", border_style="magenta"))
-    for i, w in enumerate(wonders, 1):
-        text = w.get("text", "")
-        console.print(f"[magenta]{i}.[/magenta] {text}")
-        console.print()
-
-    current_model = _load_self_model()
-    wc = current_model.get("wonder_count", len(wonders))
-    console.print(f"[dim]{wc} wonder{'s' if wc != 1 else ''} collected total[/dim]")
 @cli.command()
 @click.option("--refresh", "-r", default=4, help="Refresh rate per second (default 4)")
 def watch(refresh):
