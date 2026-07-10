@@ -9,6 +9,8 @@
 #   4. Change-size    — rolls back if delta > 80 lines (catastrophic rewrite guard)
 #   5. Syntax check   — rolls back on any Python parse error
 #   6. Runtime check  — rolls back if ginja --help fails (catches import errors)
+#   6b. Render check  — rolls back if `ginja _watch-smoke` fails (catches signature
+#       drift / undefined names inside _make_watch_layout that --help can't see)
 #   7. Streak abort   — pauses and alerts if 3 consecutive rollbacks occur
 
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
@@ -97,6 +99,11 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
         log "suggest-visuals: brain reviewing and auto-implementing watch improvements"
         "$GINJA" suggest-visuals --auto >> "$LOG" 2>&1 \
             && log "suggest-visuals: done" || log "suggest-visuals: FAILED (non-fatal)"
+
+        # Portrait respec — data-only (portrait.json), never code; rate-limited to 6h inside
+        log "portrait: brain redrawing its self-portrait spec"
+        "$GINJA" portrait respec >> "$LOG" 2>&1 \
+            && log "portrait: done" || log "portrait: FAILED (non-fatal)"
     fi
 
     # ── Self-eval (every 5th cycle) ───────────────────────────────────────────
@@ -132,6 +139,9 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     elif ! python3 "$GINJA" --help >/dev/null 2>&1; then
         SAFE=false
         REASON="runtime import failure"
+    elif ! python3 "$GINJA" _watch-smoke >/dev/null 2>&1; then
+        SAFE=false
+        REASON="watch render failure (_watch-smoke)"
     fi
 
     if [ "$SAFE" = "false" ]; then

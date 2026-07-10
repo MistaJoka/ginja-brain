@@ -1,0 +1,472 @@
+"""MirrorScene — animates the brain's portrait spec on a braille canvas.
+
+The LLM decides *what* the face is (portrait.json, via spec.py); this module
+decides *where every dot goes*, as a pure function of time + spec + live
+signals. No LLM calls happen here, ever.
+"""
+
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+from .braille import BrailleCanvas, render_bands
+from . import spec as specmod
+
+GINJA_DIR = Path.home() / ".ginja"
+INFERENCE_LOCK = GINJA_DIR / ".inference.lock"
+
+TAU = 2 * math.pi
+
+ENGINE_GLYPHS = {"Memory": "M", "Cognition": "C", "Perception": "P",
+                 "Effector": "E", "Drive": "D", "Safety": "S", "Spine": "◆"}
+
+
+def _hash(i: float) -> float:
+    """Deterministic pseudo-random in [0, 1) — stable across frames."""
+    return (math.sin(i * 12.9898 + 78.233) * 43758.5453) % 1.0
+
+
+# ── Live signals ────────────────────────────────────────────────────────────────
+
+class LiveSignals:
+    """1 Hz background poller: GPU, load, and the inference lock.
+
+    Never polls faster than its interval, so the mirror adds no meaningful
+    load to the box regardless of render FPS.
+    """
+
+    def __init__(self, interval: float = 1.0):
+        self.interval = interval
+        self.gpu_pct = 0
+        self.vram_used = 0
+        self.vram_total = 4096
+        self.load = 0.0
+        self.lock = None          # {"model": str, "since": iso} | None
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._poll()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self._poll()
+
+    def _poll(self):
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=2)
+            parts = [x.strip() for x in r.stdout.strip().split(",")]
+            self.gpu_pct, self.vram_used, self.vram_total = (
+                int(parts[0]), int(parts[1]), int(parts[2]))
+        except Exception:
+            pass
+        try:
+            self.load = float(Path("/proc/loadavg").read_text().split()[0])
+        except Exception:
+            pass
+        try:
+            raw = INFERENCE_LOCK.read_text().strip()
+            self.lock = json.loads(raw) if raw else None
+        except Exception:
+            self.lock = None
+
+    def thinking_secs(self):
+        """Seconds the current inference has been running, or None."""
+        if not self.lock:
+            return None
+        since = self.lock.get("since")
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(str(since))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0, (datetime.now(timezone.utc) - dt).total_seconds())
+        except Exception:
+            return 0
+
+
+# ── Scene ───────────────────────────────────────────────────────────────────────
+
+class MirrorScene:
+    def __init__(self, spec: dict, cols: int, rows: int):
+        self.spec = spec
+        self.cols, self.rows = max(20, cols), max(3, rows)
+        self.pal = specmod.blended_palette(spec)
+        self.dim = BrailleCanvas(self.cols, self.rows)
+        self.mid = BrailleCanvas(self.cols, self.rows)
+        self.bright = BrailleCanvas(self.cols, self.rows)
+        self.W, self.H = self.dim.width, self.dim.height
+        # pixels are ~twice as tall as wide in a terminal cell → squash y
+        self.aspect = 0.55
+
+    # -- composition ------------------------------------------------------------
+
+    def compose(self, t: float, signals=None):
+        """Fill the three canvases + overlay for time t. Returns overlay dict."""
+        for cv in (self.dim, self.mid, self.bright):
+            cv.clear()
+        gpu = (signals.gpu_pct if signals else 0) / 100.0
+        thinking = bool(signals and signals.lock)
+
+        s = self.spec
+        cx, cy = self.W / 2, self.H / 2
+        R = s["core"]["radius"] * min(self.W, self.H / self.aspect)
+        pulse_hz = max(0.05, s["pulse"]["base_hz"] + self.pal["pulse_bias"]
+                       + s["pulse"]["gpu_gain"] * gpu)
+        pulse = 1.0 + 0.10 * math.sin(TAU * pulse_hz * t)
+        jit = self.pal["jitter"]
+        jx = jit * R * 0.15 * math.sin(t * 2.1)
+        jy = jit * R * 0.10 * math.sin(t * 3.3 + 1.0)
+        cx, cy = cx + jx, cy + jy * self.aspect
+
+        self._weather(t, s["weather"])
+        self._rings(cx, cy, R, s["rings"], t)
+        self._core(s["core"], t, cx, cy, R * pulse, gpu)
+        overlay = self._orbiters(s["orbiters"], t, cx, cy, R)
+        self._particles(s["particles"], t, cx, cy, R)
+        if thinking:
+            self._flare(t, cx, cy, R * pulse)
+        return overlay
+
+    def _xy(self, cx, cy, r, ang):
+        return cx + r * math.cos(ang), cy + r * math.sin(ang) * self.aspect
+
+    def _core(self, core, t, cx, cy, R, gpu):
+        shape = core["shape"]
+        density = core["density"]
+        asym = core["asymmetry"]
+        b, m = self.bright, self.mid
+
+        if shape == "eye":
+            b.ellipse(cx, cy, R, R * self.aspect)
+            b.ellipse(cx, cy, R - 1, (R - 1) * self.aspect)
+            iris = R * 0.60
+            n = int(40 + 80 * density)
+            for i in range(n):
+                a = TAU * i / n + t * 0.15
+                rr = iris * (0.75 + 0.25 * _hash(i * 3.7))
+                x, y = self._xy(cx, cy, rr, a)
+                m.plot(int(x), int(y))
+            pr = max(1, R * 0.22)
+            b.circle(cx, cy, 0)  # ensure center dot
+            for i in range(int(pr)):
+                b.ellipse(cx, cy, i, i * self.aspect)
+            gl = self._xy(cx, cy, R * 0.45, -TAU / 8)
+            b.plot(int(gl[0]), int(gl[1]))
+
+        elif shape == "binocular":
+            off = R * 0.62
+            er = R * 0.48
+            look = math.sin(t * 0.4) * er * 0.25
+            for sx in (-1, 1):
+                ex = cx + sx * off
+                b.ellipse(ex, cy, er, er * self.aspect)
+                for i in range(int(max(1, er * 0.30))):
+                    b.ellipse(ex + look, cy, i, i * self.aspect)
+
+        elif shape == "torus":
+            Rm, rm = R * 0.75, R * 0.38
+            rx, rz = t * 0.5, t * 0.23
+            n = int(120 + 380 * density)
+            for i in range(n):
+                u = TAU * _hash(i * 1.3)
+                v = TAU * _hash(i * 2.9 + 5)
+                x = (Rm + rm * math.cos(v)) * math.cos(u)
+                y = (Rm + rm * math.cos(v)) * math.sin(u) * (1 - asym * 0.5)
+                z = rm * math.sin(v)
+                y, z = (y * math.cos(rx) - z * math.sin(rx),
+                        y * math.sin(rx) + z * math.cos(rx))
+                x, y = (x * math.cos(rz) - y * math.sin(rz),
+                        x * math.sin(rz) + y * math.cos(rz))
+                cv = b if z > 0 else m
+                cv.plot(int(cx + x), int(cy + y * self.aspect))
+
+        elif shape == "spiral":
+            arms = 2
+            n = int(80 + 240 * density)
+            for arm in range(arms):
+                for i in range(n // arms):
+                    th = 3 * TAU * i / (n // arms)
+                    r = R * th / (3 * TAU)
+                    a = th + t * 0.6 + arm * math.pi * (1 + asym * 0.3)
+                    x, y = self._xy(cx, cy, r, a)
+                    (b if i % 3 else m).plot(int(x), int(y))
+
+        elif shape == "starburst":
+            rays = int(8 + 16 * density)
+            for i in range(rays):
+                a = TAU * i / rays + t * 0.1
+                ln = R * (0.5 + 0.5 * abs(math.sin(t * 1.3 + _hash(i) * TAU)))
+                x0, y0 = self._xy(cx, cy, R * 0.12, a)
+                x1, y1 = self._xy(cx, cy, ln, a)
+                b.line(x0, y0, x1, y1)
+
+        elif shape == "lissajous":
+            n = int(100 + 300 * density)
+            for i in range(n):
+                p = i / n
+                x = cx + R * math.sin(3 * TAU * p + t * 0.7)
+                y = cy + R * self.aspect * math.sin(4 * TAU * p + t * 0.5 + asym)
+                (b if i > n * 0.7 else m).plot(int(x), int(y))
+
+        elif shape == "reticle":
+            m.line(cx - R, cy, cx + R, cy)
+            m.line(cx, cy - R * self.aspect, cx, cy + R * self.aspect)
+            br = R * 0.9
+            arm = R * 0.28
+            rot = t * 0.25
+            for i in range(4):
+                a = rot + TAU * i / 4 + TAU / 8
+                x, y = self._xy(cx, cy, br, a)
+                x2, y2 = self._xy(cx, cy, br, a + 0.32)
+                x3, y3 = self._xy(cx, cy, br - arm, a)
+                b.line(x, y, x2, y2)
+                b.line(x, y, x3, y3)
+            for i in range(3):
+                bx = cx + (2 * _hash(i * 7 + math.floor(t / 4)) - 1) * R * 1.3
+                by = cy + (2 * _hash(i * 13 + math.floor(t / 4)) - 1) * R * 0.8 * self.aspect
+                sz = 3 + 4 * _hash(i * 3)
+                self.dim.rect(bx - sz, by - sz * self.aspect, bx + sz, by + sz * self.aspect)
+
+        elif shape == "blocks":
+            n = 4
+            bw = R * 0.42
+            gap = bw * 0.35
+            total = n * bw + (n - 1) * gap
+            x0 = cx - total / 2
+            for i in range(n):
+                phase = math.sin(t * 1.1 + i * 1.5)
+                h = R * self.aspect * (0.9 + 0.35 * phase * (0.4 + 0.6 * _hash(i)))
+                bx = x0 + i * (bw + gap)
+                b.rect(bx, cy - h, bx + bw, cy + h)
+                for yy in range(int(cy - h) + 2, int(cy + h), 4):
+                    m.line(bx + 1, yy, bx + bw - 1, yy)
+
+        elif shape == "rain":
+            step = 2
+            for col in range(0, self.W, step):
+                speed = 8 + 18 * _hash(col * 0.37)
+                head = (t * speed + _hash(col) * (self.H + 24)) % (self.H + 24) - 12
+                self.bright.plot(col, int(head))
+                tail = int(5 + 10 * _hash(col * 1.7))
+                for k in range(1, tail):
+                    (m if k < 3 else self.dim).plot(col, int(head - k))
+
+        elif shape == "drift":
+            n = int(60 + 140 * density)
+            breathe = 1.0 + 0.18 * math.sin(t * 0.6)
+            for i in range(n):
+                a = TAU * _hash(i * 1.7) + t * 0.05 * (1 + _hash(i))
+                rr = R * breathe * (0.25 + 0.85 * _hash(i * 2.3) ** 0.5)
+                x, y = self._xy(cx, cy, rr, a)
+                w = 1.5 * math.sin(t * 0.9 + _hash(i * 5) * TAU)
+                (m if _hash(i * 9) > 0.3 else b).plot(int(x + w), int(y))
+
+    def _rings(self, cx, cy, R, rings, t):
+        for i in range(rings):
+            r = R * (1.15 + 0.14 * (i + 1))
+            wob = 1 + 0.02 * math.sin(t * 0.4 + i)
+            self.dim.ellipse(cx, cy, r * wob, r * wob * self.aspect,
+                             steps=int(20 + r * 1.5))
+
+    def _orbiters(self, orbiters, t, cx, cy, R):
+        overlay = {}
+        n = len(orbiters)
+        for i, o in enumerate(orbiters):
+            act = o["activity"]
+            orbit = R * (1.45 + 0.13 * (i % 3))
+            a = TAU * i / n + t * (0.12 + 0.5 * act)
+            x, y = self._xy(cx, cy, orbit, a)
+            size = 1 + int(act * 2)
+            for rr in range(size):
+                self.mid.ellipse(x, y, rr, rr * self.aspect, steps=12)
+            row, col = int(y) >> 2, int(x) >> 1
+            if 0 <= row < self.rows and 0 <= col < self.cols:
+                overlay[(row, col)] = (ENGINE_GLYPHS[o["engine"]], 2)
+        return overlay
+
+    def _particles(self, particles, t, cx, cy, R):
+        style = particles["style"]
+        for i in range(particles["count"]):
+            h1, h2 = _hash(i * 3.1), _hash(i * 7.7)
+            if style == "orbit":
+                a = TAU * h1 + t * 0.2 * (0.5 + h2)
+                r = R * (1.8 + 1.6 * h2)
+                x, y = self._xy(cx, cy, r, a)
+            elif style == "rise":
+                x = h1 * self.W
+                y = (h2 * self.H - t * (4 + 6 * h1)) % self.H
+            elif style == "fall":
+                x = h1 * self.W
+                y = (h2 * self.H + t * (4 + 6 * h1)) % self.H
+            else:  # swirl
+                a = TAU * h1 + t * (0.3 + 0.4 * h2)
+                r = (self.W / 2) * ((h2 + t * 0.02) % 1.0)
+                x, y = self._xy(cx, cy, r, a)
+            self.dim.plot(int(x), int(y))
+
+    def _weather(self, t, weather):
+        if weather == "clear":
+            return
+        if weather == "storm":
+            for i in range(24):
+                x0 = (_hash(i) * self.W + t * 30) % self.W
+                y0 = _hash(i * 3) * self.H
+                self.dim.line(x0, y0, x0 - 4, y0 + 6)
+        elif weather == "aurora":
+            for x in range(0, self.W, 2):
+                y = 3 + 3 * math.sin(x * 0.12 + t * 0.8) + 2 * math.sin(x * 0.05 - t * 0.3)
+                self.dim.plot(x, int(y))
+                self.dim.plot(x, int(y + 2))
+        elif weather == "drift":
+            for i in range(16):
+                x = (_hash(i * 11) * self.W + t * (2 + 3 * _hash(i))) % self.W
+                y = _hash(i * 5) * self.H
+                self.dim.plot(int(x), int(y))
+
+    def _flare(self, t, cx, cy, R):
+        rays = 8
+        for i in range(rays):
+            a = TAU * i / rays + t * 2.2
+            x0, y0 = self._xy(cx, cy, R * 1.02, a)
+            x1, y1 = self._xy(cx, cy, R * (1.18 + 0.06 * math.sin(t * 9 + i)), a)
+            self.bright.line(x0, y0, x1, y1)
+
+    # -- output -----------------------------------------------------------------
+
+    def frame(self, t: float, signals=None) -> list:
+        """Plain braille rows (no color) — used by `watch` and smoke tests."""
+        overlay = self.compose(t, signals)
+        rows = []
+        canvases = (self.dim, self.mid, self.bright)
+        for r in range(self.rows):
+            chars = []
+            for c in range(self.cols):
+                ov = overlay.get((r, c))
+                if ov is not None:
+                    chars.append(ov[0])
+                    continue
+                bits = 0
+                for cv in canvases:
+                    bits |= cv.buf[r * self.cols + c]
+                chars.append(chr(0x2800 + bits) if bits else " ")
+            rows.append("".join(chars))
+        return rows
+
+    def frame_ansi(self, t: float, signals=None) -> list:
+        overlay = self.compose(t, signals)
+        return render_bands((self.dim, self.mid, self.bright),
+                            list(self.pal["ansi"]), overlay)
+
+    def status_lines(self, signals=None) -> list:
+        s = self.spec
+        pal = self.pal
+        dimc, midc, brightc = pal["ansi"]
+        arch = specmod.ARCHETYPES[pal["primary"]]["inspiration"]
+        if pal["secondary"]:
+            arch += f"  ×  {specmod.ARCHETYPES[pal['secondary']]['inspiration']}"
+        l1 = f"\x1b[38;5;{brightc}m{s['motto']}\x1b[0m  \x1b[38;5;{dimc}m·  {arch}\x1b[0m"
+        l2 = (f"\x1b[38;5;{dimc}mevo #{s['evolution_count']}  ·  rings {s['rings']}"
+              f"  ·  weather {s['weather']}\x1b[0m")
+        lines = [_center_ansi(l1, self.cols), _center_ansi(l2, self.cols)]
+        if signals is not None:
+            if signals.lock:
+                model = signals.lock.get("model", "?")
+                secs = int(signals.thinking_secs() or 0)
+                lines.append(_center_ansi(
+                    f"\x1b[38;5;{brightc}m▶ thinking with {model} · {secs}s\x1b[0m",
+                    self.cols))
+            else:
+                lines.append(_center_ansi(
+                    f"\x1b[38;5;{dimc}mgpu {signals.gpu_pct}%  ·  load {signals.load:.2f}"
+                    f"  ·  idle\x1b[0m", self.cols))
+        return lines
+
+
+def _visible_len(s: str) -> int:
+    out, i = 0, 0
+    while i < len(s):
+        if s[i] == "\x1b":
+            j = s.find("m", i)
+            i = (j + 1) if j != -1 else len(s)
+        else:
+            out += 1
+            i += 1
+    return out
+
+
+def _center_ansi(s: str, width: int) -> str:
+    pad = max(0, (width - _visible_len(s)) // 2)
+    return " " * pad + s
+
+
+# ── Entry points ────────────────────────────────────────────────────────────────
+
+_strip_cache = {}
+
+
+def mirror_strip(frame: int, self_model: dict, gpu_pct: int,
+                 cols: int = 34, rows: int = 4) -> str:
+    """Small plain-text mirror band for embedding in `ginja watch` panels."""
+    key = (cols, rows)
+    scene = _strip_cache.get(key)
+    spec_mtime = specmod.PORTRAIT_FILE.stat().st_mtime if specmod.PORTRAIT_FILE.exists() else 0
+    if scene is None or scene[1] != spec_mtime:
+        scene = (MirrorScene(specmod.load_spec(), cols, rows), spec_mtime)
+        _strip_cache[key] = scene
+    sig = type("S", (), {"gpu_pct": gpu_pct, "lock": None, "load": 0.0})()
+    return "\n".join(scene[0].frame(frame * 0.25, sig))
+
+
+def run(fps: float = 15.0):
+    """Full-screen mirror: raw ANSI on the alternate screen. Ctrl-C to exit."""
+    fps = max(1.0, min(30.0, fps))
+    size = shutil.get_terminal_size((100, 32))
+    cols, rows = size.columns, max(8, size.lines - 4)  # 3 status + 1 spare
+
+    spec = specmod.load_spec()
+    scene = MirrorScene(spec, cols, rows)
+    signals = LiveSignals().start()
+    spec_mtime = specmod.PORTRAIT_FILE.stat().st_mtime if specmod.PORTRAIT_FILE.exists() else 0
+    last_spec_check = 0.0
+
+    out = sys.stdout
+    out.write("\x1b[?1049h\x1b[?25l\x1b[2J")  # alt screen, hide cursor
+    t0 = time.monotonic()
+    try:
+        while True:
+            t = time.monotonic() - t0
+            # hot-reload the spec if the brain redraws itself mid-session
+            if t - last_spec_check > 5:
+                last_spec_check = t
+                mt = specmod.PORTRAIT_FILE.stat().st_mtime if specmod.PORTRAIT_FILE.exists() else 0
+                if mt != spec_mtime:
+                    spec_mtime = mt
+                    scene = MirrorScene(specmod.load_spec(), cols, rows)
+            rows_ansi = scene.frame_ansi(t, signals)
+            rows_ansi += scene.status_lines(signals)
+            out.write("\x1b[H" + "\x1b[K\r\n".join(rows_ansi) + "\x1b[K")
+            out.flush()
+            elapsed = (time.monotonic() - t0) - t
+            time.sleep(max(0.0, 1.0 / fps - elapsed))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        signals.stop()
+        out.write("\x1b[?25h\x1b[?1049l")  # restore cursor + screen
+        out.flush()

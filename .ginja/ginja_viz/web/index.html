@@ -1,0 +1,741 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ginja-brain</title>
+<style>
+  :root {
+    --bg: #020b12; --primary: #00e5ff; --secondary: #4dd0e1;
+    --accent: #b2ebf2; --text: #d9f6fb;
+    --panel: rgba(255,255,255,0.03); --border: rgba(255,255,255,0.09);
+    --muted: rgba(255,255,255,0.45); --grid: rgba(255,255,255,0.07);
+    /* fixed categorical palette (validated, dark surface) — identity, never re-sorted */
+    --cat-tool: #3987e5; --cat-concept: #199e70; --cat-system: #c98500;
+    --cat-goal: #9085e9; --cat-technique: #e66767;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.45 "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    min-height: 100vh; transition: background 1.2s ease;
+  }
+  #topbar {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+  }
+  #banner { font-size: 17px; font-weight: 700; color: var(--primary); letter-spacing: 0.5px; }
+  #arch-name { color: var(--muted); font-style: italic; }
+  #live-status { margin-left: auto; color: var(--muted); }
+  #live-status.thinking { color: var(--accent); }
+  #live-status.thinking::before { content: "▶ "; animation: blink 1.1s infinite; }
+  @keyframes blink { 50% { opacity: 0.25; } }
+
+  main {
+    display: grid; gap: 14px; padding: 14px 20px 28px;
+    grid-template-columns: repeat(12, 1fr);
+  }
+  section {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 14px; min-width: 0;
+  }
+  h2 {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 1.5px; color: var(--muted); margin-bottom: 10px;
+  }
+  #portrait-panel { grid-column: span 5; }
+  #graph-panel { grid-column: span 7; position: relative; }
+  #engines-panel { grid-column: span 4; }
+  #eval-panel { grid-column: span 4; }
+  #vitals-panel { grid-column: span 4; }
+  #goals-panel { grid-column: span 5; }
+  #story-panel { grid-column: span 7; }
+  @media (max-width: 1100px) {
+    #portrait-panel, #graph-panel, #goals-panel, #story-panel { grid-column: span 12; }
+    #engines-panel, #eval-panel, #vitals-panel { grid-column: span 12; }
+  }
+
+  canvas { display: block; width: 100%; border-radius: 4px; }
+  #portrait-caption { margin-top: 10px; }
+  #motto { color: var(--accent); font-weight: 600; }
+  #artist-statement { color: var(--muted); font-style: italic; margin-top: 6px; font-size: 13px; }
+
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .chip {
+    border: 1px solid var(--border); background: transparent; color: var(--muted);
+    font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 999px; cursor: pointer;
+  }
+  .chip.on { color: var(--text); border-color: var(--primary); }
+  #node-detail {
+    position: absolute; right: 14px; top: 46px; width: 240px; display: none;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-size: 12px; z-index: 5;
+  }
+  #node-detail b { color: var(--accent); }
+  #node-detail .dim { color: var(--muted); }
+  #graph-meta { color: var(--muted); font-size: 11px; margin-top: 6px; }
+
+  .engine-row { display: grid; grid-template-columns: 98px 1fr 38px; gap: 8px; align-items: center; margin: 7px 0; }
+  .engine-name { color: var(--text); font-size: 12px; }
+  .engine-track { background: var(--grid); border-radius: 4px; height: 10px; overflow: hidden; }
+  .engine-fill { height: 100%; border-radius: 0 4px 4px 0; background: var(--primary); transition: width 0.8s ease; }
+  .engine-val { color: var(--muted); font-size: 11px; text-align: right; }
+
+  svg text { font: 10px/1 "SF Mono", Menlo, monospace; fill: var(--muted); }
+  .legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  #tooltip {
+    position: fixed; display: none; pointer-events: none; z-index: 10;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 9px; font-size: 11px; white-space: pre; color: var(--text);
+  }
+
+  .goal { margin: 8px 0; font-size: 13px; }
+  .goal .tag { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .story-item { border-left: 2px solid var(--border); padding: 2px 0 2px 10px; margin: 8px 0; font-size: 12px; }
+  .story-item .cyc { color: var(--accent); }
+  .story-item .dim { color: var(--muted); }
+</style>
+
+<div id="topbar">
+  <span id="banner">◉ ginja-brain ◉</span>
+  <span id="arch-name"></span>
+  <span id="evo-phase" style="color:var(--muted)"></span>
+  <span id="live-status">connecting…</span>
+</div>
+
+<main>
+  <section id="portrait-panel">
+    <h2>self-portrait — how it sees itself</h2>
+    <canvas id="portrait" height="360"></canvas>
+    <div id="portrait-caption">
+      <div id="motto"></div>
+      <div id="artist-statement"></div>
+    </div>
+  </section>
+
+  <section id="graph-panel">
+    <h2>knowledge graph — what it knows</h2>
+    <div class="chips" id="graph-chips"></div>
+    <canvas id="kg" height="430"></canvas>
+    <div id="graph-meta"></div>
+    <div id="node-detail"></div>
+  </section>
+
+  <section id="engines-panel">
+    <h2>engine activity</h2>
+    <div id="engines"></div>
+  </section>
+
+  <section id="eval-panel">
+    <h2>self-eval trend (weighted score)</h2>
+    <div id="eval-chart"></div>
+  </section>
+
+  <section id="vitals-panel">
+    <h2>world perception — 24h</h2>
+    <div class="legend">
+      <span><i style="background:var(--cat-tool)"></i>GPU %</span>
+      <span><i style="background:var(--cat-concept)"></i>RAM GB</span>
+      <span><i style="background:var(--cat-system)"></i>load</span>
+    </div>
+    <div id="vitals-chart"></div>
+  </section>
+
+  <section id="goals-panel">
+    <h2>drive — goals</h2>
+    <div id="goals"></div>
+  </section>
+
+  <section id="story-panel">
+    <h2>evolution narrative</h2>
+    <div id="story"></div>
+  </section>
+</main>
+<div id="tooltip"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+window.onerror = (msg, src, line) => {
+  const el = document.getElementById("live-status");
+  if (el) { el.textContent = `js error: ${msg} @${line}`; el.style.color = "#e66767"; }
+};
+const TAU = Math.PI * 2;
+const hash = i => (Math.sin(i * 12.9898 + 78.233) * 43758.5453) % 1 * 0.5 + 0.5;
+const CAT = { tool: "#3987e5", concept: "#199e70", system: "#c98500",
+              goal: "#9085e9", technique: "#e66767" };
+const ENGINE_GLYPHS = { Memory:"M", Cognition:"C", Perception:"P", Effector:"E",
+                        Drive:"D", Safety:"S", Spine:"◆" };
+
+let spec = null, vitals = { gpu_pct: 0, lock: null }, selfModel = {};
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+function applyTheme(p) {
+  const hx = p._resolved && p._resolved.hex;
+  if (!hx) return;
+  const r = document.documentElement.style;
+  r.setProperty("--bg", hx.bg); r.setProperty("--primary", hx.primary);
+  r.setProperty("--secondary", hx.secondary); r.setProperty("--accent", hx.accent);
+  r.setProperty("--text", hx.text);
+  const arch = p._archetypes && p._archetypes[p.archetype.primary];
+  let name = arch ? arch.inspiration : p.archetype.primary;
+  if (p.archetype.secondary && p._archetypes[p.archetype.secondary])
+    name += "  ×  " + p._archetypes[p.archetype.secondary].inspiration;
+  $("arch-name").textContent = name;
+  $("motto").textContent = p.motto || "";
+  $("artist-statement").textContent = p.artist_statement || "";
+}
+
+// ── Portrait canvas (same semantic mapping as the braille mirror) ─────────────
+const pc = $("portrait"), pctx = pc.getContext("2d");
+function sizeCanvas(c) {
+  const dpr = window.devicePixelRatio || 1;
+  c.dataset.h = c.dataset.h || c.getAttribute("height"); // pixel-buffer writes clobber the attr
+  const w = c.clientWidth, h = parseInt(c.dataset.h);
+  c.width = w * dpr; c.height = h * dpr; c.style.height = h + "px";
+  c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [w, h];
+}
+let pW = 0, pH = 0;
+function portraitFrame(tms) {
+  requestAnimationFrame(portraitFrame);
+  if (!spec) return;
+  if (!pW) [pW, pH] = sizeCanvas(pc);
+  const t = tms / 1000, hx = spec._resolved.hex;
+  const jit = spec._resolved.jitter || 0, bias = spec._resolved.pulse_bias || 0;
+  const gpu = (vitals.gpu_pct || 0) / 100, thinking = !!vitals.lock;
+  const ctx = pctx;
+  ctx.clearRect(0, 0, pW, pH);
+  const cx = pW / 2 + jit * 8 * Math.sin(t * 2.1);
+  const cy = pH / 2 + jit * 5 * Math.sin(t * 3.3 + 1);
+  const R = Math.min(pW, pH) * spec.core.radius;
+  const hz = Math.max(0.05, spec.pulse.base_hz + bias + spec.pulse.gpu_gain * gpu);
+  const pulse = 1 + 0.1 * Math.sin(TAU * hz * t);
+
+  weather(ctx, t, hx);
+  // growth rings
+  ctx.strokeStyle = hx.secondary + "55"; ctx.lineWidth = 1;
+  for (let i = 0; i < spec.rings; i++) {
+    const rr = R * (1.15 + 0.14 * (i + 1)) * (1 + 0.02 * Math.sin(t * 0.4 + i));
+    ctx.beginPath(); ctx.arc(cx, cy, rr, 0, TAU); ctx.stroke();
+  }
+  core(ctx, t, cx, cy, R * pulse, gpu, hx);
+  orbiters(ctx, t, cx, cy, R, hx);
+  particles(ctx, t, cx, cy, R, hx);
+  if (thinking) flare(ctx, t, cx, cy, R * pulse, hx);
+}
+
+function glow(ctx, color, blur) { ctx.shadowColor = color; ctx.shadowBlur = blur; }
+function noGlow(ctx) { ctx.shadowBlur = 0; }
+
+function core(ctx, t, cx, cy, R, gpu, hx) {
+  const shape = spec.core.shape, den = spec.core.density, asym = spec.core.asymmetry;
+  ctx.fillStyle = hx.primary; ctx.strokeStyle = hx.primary; ctx.lineWidth = 1.5;
+  glow(ctx, hx.primary, 14);
+  if (shape === "eye") {
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.stroke();
+    ctx.fillStyle = hx.secondary + "88";
+    const n = 40 + 80 * den;
+    for (let i = 0; i < n; i++) {
+      const a = TAU * i / n + t * 0.15, rr = R * 0.6 * (0.75 + 0.25 * hash(i * 3.7));
+      ctx.fillRect(cx + rr * Math.cos(a) - 1, cy + rr * Math.sin(a) - 1, 2, 2);
+    }
+    ctx.fillStyle = hx.primary;
+    ctx.beginPath(); ctx.arc(cx, cy, R * 0.22, 0, TAU); ctx.fill();
+    ctx.fillStyle = hx.accent;
+    ctx.beginPath(); ctx.arc(cx + R * 0.32, cy - R * 0.32, R * 0.05, 0, TAU); ctx.fill();
+  } else if (shape === "binocular") {
+    const off = R * 0.62, er = R * 0.48, look = Math.sin(t * 0.4) * er * 0.25;
+    for (const s of [-1, 1]) {
+      ctx.beginPath(); ctx.arc(cx + s * off, cy, er, 0, TAU); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx + s * off + look, cy, er * 0.3, 0, TAU); ctx.fill();
+    }
+  } else if (shape === "torus") {
+    const Rm = R * 0.75, rm = R * 0.38, rx = t * 0.5, rz = t * 0.23, n = 140 + 420 * den;
+    for (let i = 0; i < n; i++) {
+      const u = TAU * hash(i * 1.3), v = TAU * hash(i * 2.9 + 5);
+      let x = (Rm + rm * Math.cos(v)) * Math.cos(u);
+      let y = (Rm + rm * Math.cos(v)) * Math.sin(u) * (1 - asym * 0.5);
+      let z = rm * Math.sin(v);
+      [y, z] = [y * Math.cos(rx) - z * Math.sin(rx), y * Math.sin(rx) + z * Math.cos(rx)];
+      [x, y] = [x * Math.cos(rz) - y * Math.sin(rz), x * Math.sin(rz) + y * Math.cos(rz)];
+      ctx.fillStyle = z > 0 ? hx.primary : hx.secondary + "77";
+      ctx.fillRect(cx + x - 1, cy + y - 1, 2, 2);
+    }
+  } else if (shape === "spiral") {
+    const n = 90 + 260 * den;
+    for (let arm = 0; arm < 2; arm++)
+      for (let i = 0; i < n / 2; i++) {
+        const th = 3 * TAU * i / (n / 2), r = R * th / (3 * TAU);
+        const a = th + t * 0.6 + arm * Math.PI * (1 + asym * 0.3);
+        ctx.fillStyle = i % 3 ? hx.primary : hx.secondary;
+        ctx.fillRect(cx + r * Math.cos(a) - 1, cy + r * Math.sin(a) - 1, 2, 2);
+      }
+  } else if (shape === "starburst") {
+    const rays = 8 + Math.floor(16 * den);
+    for (let i = 0; i < rays; i++) {
+      const a = TAU * i / rays + t * 0.1;
+      const ln = R * (0.5 + 0.5 * Math.abs(Math.sin(t * 1.3 + hash(i) * TAU)));
+      ctx.beginPath();
+      ctx.moveTo(cx + R * 0.12 * Math.cos(a), cy + R * 0.12 * Math.sin(a));
+      ctx.lineTo(cx + ln * Math.cos(a), cy + ln * Math.sin(a)); ctx.stroke();
+    }
+  } else if (shape === "lissajous") {
+    const n = 120 + 320 * den;
+    for (let i = 0; i < n; i++) {
+      const p = i / n;
+      ctx.fillStyle = p > 0.7 ? hx.primary : hx.secondary + "88";
+      ctx.fillRect(cx + R * Math.sin(3 * TAU * p + t * 0.7) - 1,
+                   cy + R * Math.sin(4 * TAU * p + t * 0.5 + asym) - 1, 2, 2);
+    }
+  } else if (shape === "reticle") {
+    ctx.strokeStyle = hx.secondary + "88";
+    ctx.beginPath(); ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
+    ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R); ctx.stroke();
+    ctx.strokeStyle = hx.primary; ctx.lineWidth = 2;
+    for (let i = 0; i < 4; i++) {
+      const a = t * 0.25 + TAU * i / 4 + TAU / 8, br = R * 0.9;
+      ctx.beginPath();
+      ctx.arc(cx, cy, br, a, a + 0.32); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(cx + br * Math.cos(a), cy + br * Math.sin(a));
+      ctx.lineTo(cx + (br - R * 0.28) * Math.cos(a), cy + (br - R * 0.28) * Math.sin(a));
+      ctx.stroke();
+    }
+    ctx.strokeStyle = hx.accent + "66"; ctx.lineWidth = 1;
+    for (let i = 0; i < 3; i++) {
+      const bx = cx + (2 * hash(i * 7 + Math.floor(t / 4)) - 1) * R * 1.3;
+      const by = cy + (2 * hash(i * 13 + Math.floor(t / 4)) - 1) * R * 0.8;
+      const sz = 8 + 10 * hash(i * 3);
+      ctx.strokeRect(bx - sz, by - sz * 0.7, sz * 2, sz * 1.4);
+    }
+  } else if (shape === "blocks") {
+    const n = 4, bw = R * 0.42, gap = bw * 0.35, x0 = cx - (n * bw + (n - 1) * gap) / 2;
+    for (let i = 0; i < n; i++) {
+      const ph = Math.sin(t * 1.1 + i * 1.5);
+      const h = R * (0.9 + 0.35 * ph * (0.4 + 0.6 * hash(i)));
+      ctx.strokeRect(x0 + i * (bw + gap), cy - h, bw, 2 * h);
+      ctx.fillStyle = hx.secondary + "33";
+      ctx.fillRect(x0 + i * (bw + gap), cy - h, bw, 2 * h);
+    }
+  } else if (shape === "rain") {
+    noGlow(ctx);
+    for (let col = 0; col < pW; col += 11) {
+      const speed = 40 + 90 * hash(col * 0.37);
+      const head = (t * speed + hash(col) * (pH + 120)) % (pH + 120) - 60;
+      ctx.fillStyle = hx.accent;
+      ctx.fillText(String.fromCharCode(0x30a0 + Math.floor(hash(col + Math.floor(head / 14)) * 90)), col, head);
+      ctx.fillStyle = hx.secondary + "99";
+      const tail = 4 + Math.floor(8 * hash(col * 1.7));
+      for (let k = 1; k < tail; k++)
+        ctx.fillText(String.fromCharCode(0x30a0 + Math.floor(hash(col * k) * 90)), col, head - k * 14);
+    }
+  } else { // drift
+    const n = 70 + 160 * den, breathe = 1 + 0.18 * Math.sin(t * 0.6);
+    for (let i = 0; i < n; i++) {
+      const a = TAU * hash(i * 1.7) + t * 0.05 * (1 + hash(i));
+      const rr = R * breathe * (0.25 + 0.85 * Math.sqrt(hash(i * 2.3)));
+      const w = 3 * Math.sin(t * 0.9 + hash(i * 5) * TAU);
+      ctx.fillStyle = hash(i * 9) > 0.3 ? hx.secondary + "aa" : hx.primary;
+      ctx.beginPath();
+      ctx.arc(cx + rr * Math.cos(a) + w, cy + rr * Math.sin(a), 1.6, 0, TAU); ctx.fill();
+    }
+  }
+  noGlow(ctx);
+}
+
+function orbiters(ctx, t, cx, cy, R, hx) {
+  const n = spec.orbiters.length;
+  ctx.font = "11px Menlo, monospace";
+  spec.orbiters.forEach((o, i) => {
+    const orbit = R * (1.45 + 0.13 * (i % 3));
+    const a = TAU * i / n + t * (0.12 + 0.5 * o.activity);
+    const x = cx + orbit * Math.cos(a), y = cy + orbit * Math.sin(a);
+    ctx.fillStyle = hx.accent; glow(ctx, hx.accent, 8);
+    ctx.beginPath(); ctx.arc(x, y, 2 + 3 * o.activity, 0, TAU); ctx.fill(); noGlow(ctx);
+    ctx.fillStyle = hx.text + "cc";
+    ctx.fillText(ENGINE_GLYPHS[o.engine] || "?", x + 7, y + 3);
+  });
+}
+
+function particles(ctx, t, cx, cy, R, hx) {
+  const p = spec.particles; ctx.fillStyle = hx.secondary + "66";
+  for (let i = 0; i < p.count; i++) {
+    const h1 = hash(i * 3.1), h2 = hash(i * 7.7);
+    let x, y;
+    if (p.style === "orbit") {
+      const a = TAU * h1 + t * 0.2 * (0.5 + h2), r = R * (1.8 + 1.6 * h2);
+      x = cx + r * Math.cos(a); y = cy + r * Math.sin(a);
+    } else if (p.style === "rise") {
+      x = h1 * pW; y = ((h2 * pH - t * (14 + 20 * h1)) % pH + pH) % pH;
+    } else if (p.style === "fall") {
+      x = h1 * pW; y = (h2 * pH + t * (14 + 20 * h1)) % pH;
+    } else {
+      const a = TAU * h1 + t * (0.3 + 0.4 * h2), r = (pW / 2) * ((h2 + t * 0.02) % 1);
+      x = cx + r * Math.cos(a); y = cy + r * Math.sin(a);
+    }
+    ctx.fillRect(x, y, 1.5, 1.5);
+  }
+}
+
+function weather(ctx, t, hx) {
+  const w = spec.weather;
+  if (w === "clear") return;
+  ctx.strokeStyle = hx.secondary + "44"; ctx.fillStyle = hx.secondary + "44";
+  if (w === "storm") {
+    for (let i = 0; i < 24; i++) {
+      const x0 = (hash(i) * pW + t * 110) % pW, y0 = hash(i * 3) * pH;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 - 9, y0 + 14); ctx.stroke();
+    }
+  } else if (w === "aurora") {
+    ctx.beginPath();
+    for (let x = 0; x <= pW; x += 6) {
+      const y = 22 + 12 * Math.sin(x * 0.03 + t * 0.8) + 8 * Math.sin(x * 0.013 - t * 0.3);
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  } else if (w === "drift") {
+    for (let i = 0; i < 16; i++) {
+      const x = (hash(i * 11) * pW + t * (7 + 10 * hash(i))) % pW;
+      ctx.fillRect(x, hash(i * 5) * pH, 2, 2);
+    }
+  }
+}
+
+function flare(ctx, t, cx, cy, R, hx) {
+  ctx.strokeStyle = hx.accent; ctx.lineWidth = 1.5; glow(ctx, hx.accent, 12);
+  for (let i = 0; i < 8; i++) {
+    const a = TAU * i / 8 + t * 2.2;
+    const r1 = R * 1.02, r2 = R * (1.18 + 0.06 * Math.sin(t * 9 + i));
+    ctx.beginPath();
+    ctx.moveTo(cx + r1 * Math.cos(a), cy + r1 * Math.sin(a));
+    ctx.lineTo(cx + r2 * Math.cos(a), cy + r2 * Math.sin(a));
+    ctx.stroke();
+  }
+  noGlow(ctx);
+}
+
+// ── Knowledge graph (canvas force sim) ────────────────────────────────────────
+const kg = $("kg"), kctx = kg.getContext("2d");
+let gW = 0, gH = 0, gNodes = [], gEdges = [], gAdj = {}, gAlpha = 0;
+let view = { x: 0, y: 0, k: 1 }, hoverNode = null, selNode = null;
+let filters = { domain: null, category: null };
+
+async function loadGraph() {
+  const q = new URLSearchParams({ limit: "600" });
+  if (filters.domain) q.set("domain", filters.domain);
+  if (filters.category) q.set("category", filters.category);
+  const g = await (await fetch("/api/graph?" + q)).json();
+  [gW, gH] = sizeCanvas(kg);
+  const deg = {};
+  g.edges.forEach(e => { deg[e.source] = (deg[e.source] || 0) + 1; deg[e.target] = (deg[e.target] || 0) + 1; });
+  gNodes = g.nodes.map((n, i) => ({
+    ...n, deg: deg[n.id] || 0,
+    x: gW / 2 + (hash(i * 1.7) - 0.5) * gW * 0.9,
+    y: gH / 2 + (hash(i * 3.3) - 0.5) * gH * 0.9,
+    vx: 0, vy: 0,
+  }));
+  const byId = Object.fromEntries(gNodes.map(n => [n.id, n]));
+  gEdges = g.edges.map(e => ({ ...e, s: byId[e.source], t: byId[e.target] })).filter(e => e.s && e.t);
+  gAdj = {};
+  gEdges.forEach(e => {
+    (gAdj[e.source] = gAdj[e.source] || []).push(e.t);
+    (gAdj[e.target] = gAdj[e.target] || []).push(e.s);
+  });
+  gAlpha = 1;
+  $("graph-meta").textContent =
+    `${g.nodes.length} nodes · ${g.edges.length} edges` +
+    (g.truncated ? ` (top by connectivity of ${g.total_nodes})` : "");
+}
+
+function simTick() {
+  if (gAlpha < 0.005) return;
+  gAlpha *= 0.985;
+  const cell = 60, grid = new Map();
+  gNodes.forEach(n => {
+    const k = ((n.x / cell) | 0) + "," + ((n.y / cell) | 0);
+    (grid.get(k) || grid.set(k, []).get(k)).push(n);
+  });
+  // repulsion via neighboring buckets
+  gNodes.forEach(n => {
+    const gx = (n.x / cell) | 0, gy = (n.y / cell) | 0;
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+      const bucket = grid.get((gx + dx) + "," + (gy + dy));
+      if (!bucket) continue;
+      for (const m of bucket) {
+        if (m === n) continue;
+        let ddx = n.x - m.x, ddy = n.y - m.y;
+        let d2 = ddx * ddx + ddy * ddy;
+        if (d2 < 1) { ddx = hash(n.deg) - 0.5; ddy = 0.5 - hash(m.deg); d2 = 1; }
+        if (d2 > cell * cell * 2) continue;
+        const f = Math.min(320 / d2, 10) * gAlpha;
+        n.vx += ddx * f; n.vy += ddy * f;
+      }
+    }
+  });
+  // springs
+  gEdges.forEach(e => {
+    const dx = e.t.x - e.s.x, dy = e.t.y - e.s.y;
+    const d = Math.sqrt(dx * dx + dy * dy) || 1, want = 46;
+    const f = (d - want) / d * 0.02 * gAlpha * (e.weight || 1);
+    e.s.vx += dx * f; e.s.vy += dy * f;
+    e.t.vx -= dx * f; e.t.vy -= dy * f;
+  });
+  // centering + integrate
+  gNodes.forEach(n => {
+    n.vx += (gW / 2 - n.x) * 0.004 * gAlpha;
+    n.vy += (gH / 2 - n.y) * 0.004 * gAlpha;
+    n.vx = Math.max(-30, Math.min(30, n.vx * 0.85));
+    n.vy = Math.max(-30, Math.min(30, n.vy * 0.85));
+    n.x += n.vx; n.y += n.vy;
+  });
+}
+
+function drawGraph() {
+  requestAnimationFrame(drawGraph);
+  if (!gW) return;
+  simTick();
+  const ctx = kctx;
+  ctx.setTransform(window.devicePixelRatio || 1, 0, 0, window.devicePixelRatio || 1, 0, 0);
+  ctx.clearRect(0, 0, gW, gH);
+  ctx.translate(view.x, view.y); ctx.scale(view.k, view.k);
+  const focus = selNode || hoverNode;
+  const nbrs = focus ? new Set([focus, ...(gAdj[focus.id] || [])]) : null;
+  ctx.lineWidth = 0.6 / view.k;
+  gEdges.forEach(e => {
+    const lit = focus && (e.s === focus || e.t === focus);
+    ctx.strokeStyle = lit ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.10)";
+    ctx.beginPath(); ctx.moveTo(e.s.x, e.s.y); ctx.lineTo(e.t.x, e.t.y); ctx.stroke();
+  });
+  gNodes.forEach(n => {
+    const r = (2.4 + Math.min(6, n.deg * 0.7)) / Math.sqrt(view.k);
+    const faded = nbrs && !nbrs.has(n);
+    ctx.globalAlpha = faded ? 0.18 : 1;
+    ctx.fillStyle = CAT[n.category] || "#888";
+    ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, TAU); ctx.fill();
+    if (!faded && (n === focus || (view.k > 1.6 && n.deg > 2))) {
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.font = `${11 / view.k}px Menlo, monospace`;
+      ctx.fillText(n.label, n.x + r + 3 / view.k, n.y + 3 / view.k);
+    }
+  });
+  ctx.globalAlpha = 1;
+}
+
+function graphPointer(ev) {
+  const rect = kg.getBoundingClientRect();
+  const x = (ev.clientX - rect.left - view.x) / view.k;
+  const y = (ev.clientY - rect.top - view.y) / view.k;
+  let best = null, bd = 14 / view.k;
+  gNodes.forEach(n => {
+    const d = Math.hypot(n.x - x, n.y - y);
+    if (d < bd) { bd = d; best = n; }
+  });
+  return best;
+}
+let dragging = false, dragMoved = false, last = null;
+kg.addEventListener("pointerdown", ev => { dragging = true; dragMoved = false; last = [ev.clientX, ev.clientY]; });
+window.addEventListener("pointerup", () => { dragging = false; });
+kg.addEventListener("pointermove", ev => {
+  if (dragging) {
+    view.x += ev.clientX - last[0]; view.y += ev.clientY - last[1];
+    last = [ev.clientX, ev.clientY]; dragMoved = true;
+    return;
+  }
+  hoverNode = graphPointer(ev);
+  kg.style.cursor = hoverNode ? "pointer" : "grab";
+});
+kg.addEventListener("click", ev => {
+  if (dragMoved) return;
+  selNode = graphPointer(ev);
+  const d = $("node-detail");
+  if (!selNode) { d.style.display = "none"; return; }
+  const n = selNode;
+  d.innerHTML = `<b>${n.label}</b><br>
+    <span class="dim">${n.category} · ${n.domain} · cycle ${n.cycle}</span><br>
+    <span class="dim">links: ${n.deg} · confidence ${(+n.confidence).toFixed(2)}</span>
+    ${n.description ? "<br><br>" + n.description : ""}`;
+  d.style.display = "block";
+});
+kg.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const rect = kg.getBoundingClientRect();
+  const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+  const k2 = Math.max(0.3, Math.min(6, view.k * (ev.deltaY < 0 ? 1.15 : 0.87)));
+  view.x = mx - (mx - view.x) * k2 / view.k;
+  view.y = my - (my - view.y) * k2 / view.k;
+  view.k = k2;
+}, { passive: false });
+
+function buildChips() {
+  const box = $("graph-chips");
+  const mk = (label, group, val) => {
+    const b = document.createElement("button");
+    b.className = "chip"; b.textContent = label;
+    b.onclick = () => {
+      filters[group] = filters[group] === val ? null : val;
+      [...box.children].forEach(c => {
+        if (c.dataset.group === group) c.classList.toggle("on", c.dataset.val === (filters[group] || ""));
+      });
+      selNode = null; $("node-detail").style.display = "none";
+      loadGraph();
+    };
+    b.dataset.group = group; b.dataset.val = val || "";
+    box.appendChild(b);
+    return b;
+  };
+  ["homelab", "ai", "networking", "storage", "general"].forEach(d => mk(d, "domain", d));
+  const sep = document.createElement("span"); sep.style.width = "10px"; box.appendChild(sep);
+  Object.keys(CAT).forEach(c => {
+    const b = mk(c, "category", c);
+    b.style.borderColor = CAT[c] + "88";
+  });
+}
+
+// ── SVG line charts (crosshair tooltip, recessive grid) ───────────────────────
+const tooltip = $("tooltip");
+function lineChart(el, seriesList, opts) {
+  const W = el.clientWidth || 320, H = opts.height || 150;
+  const padL = 34, padR = 8, padT = 8, padB = 18;
+  const pts = seriesList.flatMap(s => s.data);
+  if (!pts.length) { el.innerHTML = "<span style='color:var(--muted)'>no data yet</span>"; return; }
+  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  let y0 = opts.y0 !== undefined ? opts.y0 : Math.min(...ys), y1 = Math.max(...ys);
+  if (y1 === y0) y1 = y0 + 1;
+  y1 += (y1 - y0) * 0.08;
+  const X = x => padL + (x - x0) / (x1 - x0 || 1) * (W - padL - padR);
+  const Y = y => padT + (1 - (y - y0) / (y1 - y0)) * (H - padT - padB);
+  let svg = `<svg width="${W}" height="${H}" style="overflow:visible">`;
+  for (let i = 0; i <= 3; i++) {
+    const yv = y0 + (y1 - y0) * i / 3, yy = Y(yv);
+    svg += `<line x1="${padL}" x2="${W - padR}" y1="${yy}" y2="${yy}" stroke="var(--grid)"/>`;
+    svg += `<text x="${padL - 5}" y="${yy + 3}" text-anchor="end">${(+yv.toFixed(yv < 10 ? 1 : 0))}</text>`;
+  }
+  seriesList.forEach(s => {
+    const d = s.data.map((p, i) => (i ? "L" : "M") + X(p.x).toFixed(1) + " " + Y(p.y).toFixed(1)).join("");
+    svg += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round"/>`;
+  });
+  const fmt = opts.fmtX || (x => new Date(x).toTimeString().slice(0, 5));
+  svg += `<text x="${padL}" y="${H - 4}">${fmt(x0)}</text>`;
+  svg += `<text x="${W - padR}" y="${H - 4}" text-anchor="end">${fmt(x1)}</text>`;
+  svg += `<line id="xh" y1="${padT}" y2="${H - padB}" stroke="rgba(255,255,255,0.3)" style="display:none"/></svg>`;
+  el.innerHTML = svg;
+  const svgEl = el.firstChild, xh = svgEl.querySelector("#xh");
+  svgEl.addEventListener("pointermove", ev => {
+    const rect = svgEl.getBoundingClientRect();
+    const px = ev.clientX - rect.left;
+    const xv = x0 + (px - padL) / (W - padL - padR) * (x1 - x0);
+    xh.setAttribute("x1", px); xh.setAttribute("x2", px); xh.style.display = "block";
+    const lines = seriesList.map(s => {
+      let bp = s.data[0];
+      s.data.forEach(p => { if (Math.abs(p.x - xv) < Math.abs(bp.x - xv)) bp = p; });
+      return `${s.name}: ${(+bp.y.toFixed(2))}`;
+    });
+    tooltip.textContent = fmt(xv) + "\n" + lines.join("\n");
+    tooltip.style.display = "block";
+    tooltip.style.left = (ev.clientX + 14) + "px";
+    tooltip.style.top = (ev.clientY - 10) + "px";
+  });
+  svgEl.addEventListener("pointerleave", () => {
+    xh.style.display = "none"; tooltip.style.display = "none";
+  });
+}
+
+// ── Panels ────────────────────────────────────────────────────────────────────
+function renderEngines() {
+  if (!spec) return;
+  $("engines").innerHTML = spec.orbiters.map(o => `
+    <div class="engine-row">
+      <span class="engine-name">${ENGINE_GLYPHS[o.engine]} ${o.engine}</span>
+      <div class="engine-track"><div class="engine-fill" style="width:${o.activity * 100}%"></div></div>
+      <span class="engine-val">${Math.round(o.activity * 100)}%</span>
+    </div>`).join("");
+}
+
+async function renderEvals() {
+  const ev = await (await fetch("/api/evals")).json();
+  const data = ev.filter(e => e.weighted_score != null)
+    .map(e => ({ x: e.evolution_count, y: e.weighted_score, raw: e }));
+  lineChart($("eval-chart"), [{ name: "score", color: "var(--primary)", data }],
+    { height: 150, y0: 0, fmtX: x => "evo #" + Math.round(x) });
+}
+
+async function renderVitals() {
+  const ts = await (await fetch("/api/timeseries?hours=24")).json();
+  const t = p => new Date(p.ts).getTime();
+  lineChart($("vitals-chart"), [
+    { name: "GPU %", color: CAT.tool, data: ts.filter(p => p.gpu_pct != null).map(p => ({ x: t(p), y: p.gpu_pct })) },
+    { name: "RAM GB", color: CAT.concept, data: ts.filter(p => p.ram_used != null).map(p => ({ x: t(p), y: p.ram_used })) },
+    { name: "load", color: CAT.system, data: ts.filter(p => p.load != null).map(p => ({ x: t(p), y: p.load })) },
+  ], { height: 150, y0: 0 });
+}
+
+async function renderGoals() {
+  const g = await (await fetch("/api/goals")).json();
+  const ns = g.goals.north_star || {};
+  const medium = g.goals.medium || [];
+  const queue = g.goals.queue || [];
+  const stack = (g.goal_stack.goals || g.goal_stack.stack || []);
+  let html = `<div class="goal"><span class="tag">★ north star</span><br>${(ns.goal || ns) || "—"}</div>`;
+  medium.slice(0, 3).forEach(m =>
+    html += `<div class="goal"><span class="tag">◎ medium</span><br>${m.goal || m}</div>`);
+  queue.slice(0, 3).forEach(q =>
+    html += `<div class="goal"><span class="tag">· queued</span><br>${q.goal || q}</div>`);
+  if (Array.isArray(stack) && stack.length)
+    html += `<div class="goal"><span class="tag">⚑ operator</span><br>${stack[0].goal || stack[0]}</div>`;
+  $("goals").innerHTML = html;
+}
+
+async function renderStory() {
+  const hist = await (await fetch("/api/learning?last=14")).json();
+  $("story").innerHTML = hist.slice().reverse().map(h => `
+    <div class="story-item">
+      <span class="cyc">#${h.cycle}</span> <b>${h.topic || ""}</b>
+      <span class="dim">${h.ts || ""}</span><br>
+      <span class="dim">${(h.techniques || []).join(" · ")}</span>
+      ${h.next_goal ? `<br><span class="dim">→ ${h.next_goal}</span>` : ""}
+    </div>`).join("");
+}
+
+// ── Live state (SSE with polling fallback) ────────────────────────────────────
+function applyState(s) {
+  const prevArch = spec && spec.archetype.primary;
+  spec = s.portrait; vitals = s.vitals; selfModel = s.self_model;
+  applyTheme(spec);
+  renderEngines();
+  $("banner").textContent = selfModel.ascii_banner || "◉ ginja-brain ◉";
+  $("evo-phase").textContent =
+    `evo #${selfModel.evolution_count || 0} · ${selfModel.phase || "?"} · ${selfModel.mood || ""}`;
+  const st = $("live-status");
+  if (vitals.lock) {
+    st.className = "thinking";
+    st.textContent = `thinking with ${vitals.lock.model || "?"}`;
+  } else {
+    st.className = "";
+    st.textContent = `idle · gpu ${vitals.gpu_pct}% · load ${(+vitals.load).toFixed(2)}`;
+  }
+  if (prevArch && prevArch !== spec.archetype.primary) loadGraph(); // theme pivot: repaint
+}
+
+function connect() {
+  try {
+    const es = new EventSource("/api/events");
+    es.onmessage = ev => applyState(JSON.parse(ev.data));
+    es.onerror = () => { es.close(); setTimeout(pollLoop, 1000); };
+  } catch (e) { pollLoop(); }
+}
+async function pollLoop() {
+  try { applyState(await (await fetch("/api/state")).json()); }
+  catch (e) { /* server briefly away */ }
+  setTimeout(pollLoop, 3000);
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+window.addEventListener("resize", () => { pW = 0; [gW, gH] = sizeCanvas(kg); gAlpha = Math.max(gAlpha, 0.1); });
+buildChips();
+connect();
+loadGraph();
+renderEvals(); renderVitals(); renderGoals(); renderStory();
+setInterval(() => { renderEvals(); renderVitals(); renderGoals(); renderStory(); }, 120000);
+requestAnimationFrame(portraitFrame);
+requestAnimationFrame(drawGraph);
+</script>

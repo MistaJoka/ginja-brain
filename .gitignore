@@ -68,3 +68,4 @@ grant_sudo.sh
 .ginja/__pycache__/
 .ginja/andre-model.json
 .ginja/today.md
+.ginja/ginja_viz/__pycache__/
