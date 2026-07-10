@@ -66,3 +66,5 @@ grant_sudo.sh
 # rss runtime state
 .ginja/rss-state.json
 .ginja/__pycache__/
+.ginja/andre-model.json
+.ginja/today.md
