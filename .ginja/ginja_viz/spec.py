@@ -274,10 +274,33 @@ def load_spec(path: Path = None) -> dict:
         return derive_default(load_self_model())
 
 
+def measured_orbiters() -> list:
+    """Snapshot real engine telemetry as an orbiter list; None if unavailable.
+
+    Lazy imports: datafeeds imports this module at load time, so importing it
+    at the top here would be circular.
+    """
+    try:
+        from . import datafeeds
+        from .telemetry import EngineTelemetry
+        acts = EngineTelemetry().refresh(datafeeds._vitals())
+        return [{"engine": e, "activity": round(float(acts[e]), 2)} for e in ENGINES]
+    except Exception:
+        return None
+
+
 def save_spec(spec: dict, path: Path = None) -> dict:
-    """Validate and atomically write a spec; returns the validated form."""
+    """Validate and atomically write a spec; returns the validated form.
+
+    Orbiter activities are stamped from live telemetry at write time — the
+    persisted spec carries measurements, never the author's guesses. If
+    telemetry is unavailable the validated input values stand as fallback.
+    """
     path = path or PORTRAIT_FILE
     spec = validate_spec(spec)
+    live = measured_orbiters()
+    if live:
+        spec["orbiters"] = live
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(spec, indent=2) + "\n")
     tmp.replace(path)
