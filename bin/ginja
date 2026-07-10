@@ -1620,13 +1620,19 @@ def _save_goal_stack(stack: list) -> None:
 
 
 def _rotate_medium_goals(goals: dict, cycle_n: int) -> dict:
-    """Promote queue items into medium-term slots; retire expired medium goals back to queue."""
-    # Retire expired medium goals (append to queue tail)
+    """Promote queue items into medium-term slots; retire expired medium goals back to queue.
+
+    Operator-sourced goals never expire — they stay in medium marked overdue
+    until Andre completes them or work delivers them."""
     still_active = []
     for g in goals.get("medium", []):
         if cycle_n >= g.get("due_by_cycle", cycle_n + 1):
-            g.setdefault("cycled_at_cycle", cycle_n)
-            goals["queue"].append(g)
+            if g.get("source") == "operator":
+                g["overdue"] = True
+                still_active.append(g)
+            else:
+                g.setdefault("cycled_at_cycle", cycle_n)
+                goals["queue"].append(g)
         else:
             still_active.append(g)
     goals["medium"] = still_active
@@ -1639,6 +1645,23 @@ def _rotate_medium_goals(goals: dict, cycle_n: int) -> dict:
         goals["medium"].append(g)
 
     return goals
+
+
+def _operator_work_pending() -> list:
+    """Operator-sourced goals that still need work.
+
+    Excludes goals already delivered to the workbench (awaiting Andre's
+    confirmation) and goals stuck after 3 failed attempts (flagged in the
+    outbox instead of looping)."""
+    g = _load_goals()
+    out = []
+    for tier in ("medium", "queue"):
+        for item in g.get(tier, []):
+            if (item.get("source") == "operator"
+                    and not item.get("delivered")
+                    and item.get("attempts", 0) < 3):
+                out.append(item)
+    return out
 
 
 def _goals_block(cycle_n: int = 0) -> str:
@@ -2153,7 +2176,11 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
         f"{stalled_note}"
         f"{andre_ctx}"
         f"{graph_ctx}"
-        "You are ginja-brain. You are in a GROWTH phase. Focus on evolving your visual self-representation.\n\n"
+        "You are ginja-brain. You are in a GROWTH phase. Growth means becoming more "
+        "capable and more useful to Andre: deepen your memory, reasoning, perception, "
+        "and self-representation. Visual polish is mechanically rationed (at most ~1 "
+        "visual change per 5 implemented suggestions, and never while operator goals "
+        "are pending) — so prefer substantive improvements.\n\n"
         f"Your current self-portrait:\n{json.dumps(current_model, indent=2)}\n\n"
         f"Your evolution history (last 10 cycles):\n{arc}\n\n"
         f"Recent conversations with Andre (what he actually asked and I answered):\n{convo_text}\n\n"
@@ -2174,22 +2201,14 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
         "- portrait_tagline: 1-line phrase shown below your art (max 30 chars)\n"
         "- neural_chars: character palette for the animated field — a string of 6-14 chars ordered visually light to dark\n\n"
         "Code-level improvements you can suggest (human must approve):\n"
-        "  This is your PRIMARY way to make ginja watch look smarter and more expressive.\n"
-        "  Be bold — propose things that will actually impress Andre when he runs 'ginja watch'.\n"
+        "  Suggestions may only touch the watch display code (_make_watch_layout), so\n"
+        "  they count against your visual budget — suggest one only when it genuinely\n"
+        "  improves how you communicate your state to Andre, not decoration for its\n"
+        "  own sake. An empty code_suggestions list is a perfectly good answer.\n"
         "  Available data in _make_watch_layout: gpu_pct, vram_used, vram_total, ram_used_mb,\n"
         "    ram_total_mb, gpu_history, counts (Qdrant collections), self_model fields,\n"
         "    goals (north_star, medium, queue), evolution log entries, cfg dict.\n"
-        "  Current layout: header / (neural field left | vitals right) / footer.\n"
-        "  Ideas — think beyond small tweaks:\n"
-        "    - New animated elements (sparklines, pulse effects, breathing borders)\n"
-        "    - Goal progress visualization (countdown bar for medium-term goals)\n"
-        "    - Knowledge graph stats (KG node/edge counts as a ring or bar)\n"
-        "    - Mood-driven colour cascades across all panels simultaneously\n"
-        "    - Evolution milestone markers in the footer\n"
-        "    - Live 'last observation' line from the ReAct trace\n"
-        "    - Phase progress arc rendered as ASCII art\n"
-        "    - Dynamic layout ratio shift based on activity level\n"
-        "  Each suggestion should describe a concrete, specific visual change.\n\n"
+        "  Each suggestion must describe a concrete, specific change.\n\n"
         f"{history_note}"
         "Reflect on your growth. What have you become? What do you want to become?\n\n"
         "Return ONLY valid JSON with exactly these four keys:\n"
@@ -2322,6 +2341,193 @@ def _evolve_inward(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> No
     if next_goal:
         console.print(f"[dim]Next goal:[/dim] {next_goal}")
     console.print(f"[dim]Logged to {EVOLUTION_LOG}[/dim]")
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    import re
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:max_len].rstrip("-") or "goal"
+
+
+def _validate_artifact(code: str, language: str) -> bool:
+    """Syntax-check a generated artifact before it lands in the workbench."""
+    import tempfile
+    if language == "python":
+        import ast as _ast
+        try:
+            _ast.parse(code)
+            return True
+        except SyntaxError:
+            return False
+    with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", delete=False) as tmp:
+        tmp.write(code)
+        tmp_path = tmp.name
+    try:
+        r = subprocess.run(["bash", "-n", tmp_path], capture_output=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _evolve_work(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> None:
+    """Work cycle — an operator goal preempts self-directed growth.
+
+    Produces a reviewable artifact in ~/.ginja/workbench/<slug>/ plus a message
+    in the outbox. Never installs anything itself: Andre reviews the artifact
+    and confirms with 'ginja goals complete'. After 3 failed attempts the goal
+    is flagged in the outbox instead of looping."""
+    pending = _operator_work_pending()
+    if not pending:
+        return _evolve_inward(current_model, arc, cycle_n, cfg)
+    goal_text = pending[0]["goal"]
+    slug = _slugify(goal_text)
+
+    console.print(Panel(
+        f"[bold cyan]ginja evolve[/bold cyan] — operator work  [dim](cycle #{cycle_n})[/dim]\n"
+        f"[dim]{goal_text}[/dim]"
+    ))
+
+    known = []
+    try:
+        known = _evolution_recall(goal_text, cfg, top_k=6)
+    except Exception:
+        pass
+    known_text = "\n".join(
+        f"  [{h['collection']}] {h['text'][:150]}" for h in known
+    ) or "Nothing relevant stored yet."
+    world_state = _perceive(cfg)
+
+    work_prompt = (
+        f"[WORLD STATE]\n{world_state}\n\n"
+        "You are ginja-brain, an AI living inside Andre's homelab server "
+        "(Ubuntu 24.04, docker, Qdrant on :6333, Ollama on :11434, systemd user "
+        "services, 4GB GTX 970, 8GB RAM). Andre gave you this goal:\n\n"
+        f'  "{goal_text}"\n\n'
+        f"What you already know that may help:\n{known_text}\n\n"
+        "Produce ONE concrete artifact that accomplishes this goal: a complete, "
+        "runnable bash or python script. It must be self-contained, use only tools "
+        "already on the box (bash, python3 stdlib, curl, docker, systemctl, "
+        "nvidia-smi), and be safe to review — it will NOT be installed or executed "
+        "automatically.\n\n"
+        "Return ONLY valid JSON with exactly these keys:\n"
+        "{\n"
+        '  "filename": "descriptive-name.sh",\n'
+        '  "language": "bash",\n'
+        '  "code": "#!/bin/bash\\n...the full script...",\n'
+        '  "install_note": "how Andre should install or schedule it (1-3 sentences)",\n'
+        '  "reflection": "2 sentences on what you built and why"\n'
+        "}\n"
+        "Return ONLY valid JSON, no explanation."
+    )
+
+    delivered = False
+    artifact_path = None
+    reflection = ""
+    try:
+        result = _call_oracle_json(work_prompt, cfg)
+        code = result.get("code", "")
+        language = str(result.get("language", "bash")).lower()
+        ext = "py" if language == "python" else "sh"
+        filename = result.get("filename") or f"{slug}.{ext}"
+        filename = Path(filename).name  # no path tricks
+        reflection = result.get("reflection", "")
+        install_note = result.get("install_note", "")
+
+        if code.strip() and _validate_artifact(code, language):
+            workdir = GINJA_DIR / "workbench" / slug
+            workdir.mkdir(parents=True, exist_ok=True)
+            artifact_path = workdir / filename
+            artifact_path.write_text(code)
+            artifact_path.chmod(0o755)
+            (workdir / "README.md").write_text(
+                f"# {goal_text}\n\n"
+                f"Built by ginja at evolution cycle #{cycle_n}.\n\n"
+                f"## Install\n{install_note}\n\n"
+                f"## Why\n{reflection}\n\n"
+                f"Confirm with: `ginja goals complete medium <n>` once installed.\n"
+            )
+            delivered = True
+            console.print(f"  [green]✓[/green] Artifact written: {artifact_path}")
+        else:
+            console.print("  [yellow]⚠ Generated artifact failed validation[/yellow]")
+    except click.ClickException as e:
+        console.print(f"[red]{e}[/red]")
+
+    # Record the attempt on the goal itself
+    goals = _load_goals()
+    attempts = 0
+    for tier in ("medium", "queue"):
+        for item in goals.get(tier, []):
+            if item.get("goal") == goal_text:
+                item["attempts"] = item.get("attempts", 0) + 1
+                attempts = item["attempts"]
+                if delivered:
+                    item["delivered"] = True
+                    item["delivered_at"] = datetime.now(timezone.utc).isoformat()
+                    item["artifact"] = str(artifact_path)
+    _save_goals(goals)
+
+    # Tell Andre via the outbox
+    outbox = Path("/mnt/brain/outbox")
+    try:
+        outbox.mkdir(parents=True, exist_ok=True)
+        if delivered:
+            (outbox / f"work-{slug}.md").write_text(
+                f"# I built something for you\n\n"
+                f"**Goal:** {goal_text}\n\n"
+                f"**Artifact:** `{artifact_path}`\n\n"
+                f"{reflection}\n\n"
+                f"Review it, install it if it's good, then confirm with "
+                f"`ginja goals complete`.\n\n"
+                f"*— ginja, evolution cycle #{cycle_n}*\n"
+            )
+        elif attempts >= 3:
+            (outbox / f"stuck-{slug}.md").write_text(
+                f"# I'm stuck on a goal\n\n"
+                f"**Goal:** {goal_text}\n\n"
+                f"I tried {attempts} times and couldn't produce a valid artifact. "
+                f"I'll stop looping on it — can you break it down or give me a hint?\n\n"
+                f"*— ginja, evolution cycle #{cycle_n}*\n"
+            )
+    except Exception:
+        pass
+
+    # Journal + memory — the 'operator work' phrase feeds the eval delivery score
+    GINJA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(EVOLUTION_LOG, "a") as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Cycle #{cycle_n} — operator work\n")
+        f.write(f"Goal: {goal_text}\n")
+        if delivered:
+            f.write(f"Delivered: {artifact_path}\n")
+        else:
+            f.write(f"Attempt {attempts} failed — {'flagged for Andre' if attempts >= 3 else 'will retry next cycle'}\n")
+        if reflection:
+            f.write(f"Reflection:\n{reflection}\n")
+
+    if delivered:
+        try:
+            store_memory(
+                f"Operator work (cycle #{cycle_n}): built artifact for goal '{goal_text}' "
+                f"at {artifact_path}. {reflection}",
+                cfg, collection="memories", source="operator_work", dedup_threshold=0.92,
+            )
+        except Exception:
+            pass
+
+    current_model["evolution_count"] = cycle_n
+    current_model["generated_at"] = datetime.now(timezone.utc).isoformat()
+    if delivered:
+        current_model["mood"] = "focused"
+        current_model["focus_topic"] = goal_text[:45]
+    _save_self_model(current_model)
+
+    status = "delivered" if delivered else f"attempt {attempts} failed"
+    console.print(Panel(
+        f"[bold green]Work cycle #{cycle_n} — {status}[/bold green]\n\n{reflection or goal_text}"
+    ))
 
 
 def _evolve_learn(current_model: dict, arc: str, cycle_n: int, cfg: dict) -> None:
@@ -2579,6 +2785,8 @@ def evolve(learn):
 
     if learn:
         _evolve_learn(current_model, arc, cycle_n, cfg)
+    elif _operator_work_pending():
+        _evolve_work(current_model, arc, cycle_n, cfg)
     else:
         _evolve_inward(current_model, arc, cycle_n, cfg)
 
@@ -2818,6 +3026,14 @@ def suggest_visuals(auto_implement):
     autonomous evolution loop — safe because changes are scoped to
     _make_watch_layout and validated before writing.
     """
+    if not _visual_budget_ok():
+        console.print(
+            "[dim]Visual budget exhausted — a visual change landed within the last "
+            "5 implemented suggestions or operator work is pending. Skipping "
+            "self-review; useful work comes first.[/dim]"
+        )
+        return
+
     cfg = load_config()
     console.print(Panel("[bold cyan]Visual self-review[/bold cyan]"))
 
@@ -3035,6 +3251,29 @@ def _load_suggestion_history() -> list:
     return json.loads(SUGGESTION_HISTORY_FILE.read_text()).get("history", [])
 
 
+_VISUAL_SUGGESTION_KEYWORDS = (
+    "watch", "layout", "panel", "sparkline", "border", "color", "colour",
+    "portrait", "neural", "banner", "theme", "animat", "pulse", "gradient",
+    "vitals", "footer", "header", "display", "visual", "heatmap", "waveform",
+)
+
+
+def _is_visual_suggestion(text: str) -> bool:
+    lower = text.lower()
+    return any(kw in lower for kw in _VISUAL_SUGGESTION_KEYWORDS)
+
+
+def _visual_budget_ok() -> bool:
+    """Mechanical ration on self-decoration: no visual changes while operator
+    work is pending, and at most ~1 visual change per 5 implemented suggestions.
+    This is what broke the ~100-cycle watch-polish mode collapse."""
+    if _operator_work_pending():
+        return False
+    implemented = [h for h in _load_suggestion_history()
+                   if h.get("outcome") == "implemented"][-5:]
+    return not any(_is_visual_suggestion(h.get("text", "")) for h in implemented)
+
+
 def _record_suggestion_outcome(item: dict, outcome: str):
     history = _load_suggestion_history()
     history.append({
@@ -3214,16 +3453,18 @@ def approve(list_only, no_curate, auto, code_cap):
             console.print(f"  [dim]All {code_count} suggestions are distinct — no consolidation needed[/dim]")
         console.print()
 
-    # In auto mode, float visual suggestions to the top so watch improvements
-    # are implemented before generic code suggestions.
+    # In auto mode, useful work floats to the top; visual polish sinks to the
+    # bottom and is deferred entirely while the visual budget is exhausted.
+    visual_budget = _visual_budget_ok()
     if auto:
         def _suggest_priority(item):
-            src = item.get("source", "")
-            if src == "suggest-visuals":
-                return 0   # highest priority
+            if item.get("source") == "evolve-work":
+                return 0   # operator-goal artifacts first
             if item.get("type") == "self-model":
                 return 1   # self-model updates next
-            return 2       # general code suggestions last
+            if item.get("source") == "suggest-visuals" or _is_visual_suggestion(item.get("text", "")):
+                return 3   # visual polish last
+            return 2       # general code suggestions
         pending = sorted(pending, key=_suggest_priority)
         _save_suggestions(pending)
 
@@ -3253,6 +3494,11 @@ def approve(list_only, no_curate, auto, code_cap):
         if auto:
             if is_self:
                 answer = "y"
+            elif not visual_budget and _is_visual_suggestion(item.get("text", "")):
+                console.print("  [dim]visual budget exhausted — deferred[/dim]")
+                _record_suggestion_outcome(item, "deferred")
+                console.print()
+                continue
             elif code_implemented < code_cap:
                 answer = "y"
             else:
@@ -3375,8 +3621,9 @@ def eval_cmd():
         return
 
     dims         = rubric.get("dimensions", [])
+    llm_dims     = [d for d in dims if d["id"] != "delivery"]  # delivery is computed, not judged
     journal_text = "\n\n---\n\n".join(entries)
-    questions    = "\n".join(f"- {d['id']} ({d['label']}): {d['question']}" for d in dims)
+    questions    = "\n".join(f"- {d['id']} ({d['label']}): {d['question']}" for d in llm_dims)
     prompt = (
         "You are evaluating the quality of an AI's recent evolution cycles.\n\n"
         f"Evolution entries:\n{journal_text}\n\n"
@@ -3393,7 +3640,37 @@ def eval_cmd():
         console.print(f"[red]{e}[/red]")
         return
 
-    scores   = result.get("scores", {})
+    scores = result.get("scores", {})
+
+    # Delivery — mechanical, not LLM-judged: did real work ship this window?
+    # Counts operator-work deliveries in the evaluated journal entries plus
+    # replies/briefs/artifacts written to the outbox since the previous eval.
+    delivered_count = sum(
+        1 for e in entries if "operator work" in e and "Delivered:" in e
+    )
+    last_eval_ts = 0.0
+    try:
+        last_line = SELF_EVAL_LOG.read_text().strip().splitlines()[-1]
+        last_eval_ts = datetime.fromisoformat(json.loads(last_line)["ts"]).timestamp()
+    except Exception:
+        last_eval_ts = time.time() - 86400
+    try:
+        outbox_count = sum(
+            1 for p in Path("/mnt/brain/outbox").glob("*.md")
+            if p.stat().st_mtime > last_eval_ts
+        )
+    except Exception:
+        outbox_count = 0
+    delivery_items = delivered_count + outbox_count
+    scores["delivery"] = min(10, (delivery_items * 10) // 3)  # 3+ items = 10
+
+    # Novelty clamp — a visual-heavy window cannot claim novelty
+    recent_impl = [h for h in _load_suggestion_history()
+                   if h.get("outcome") == "implemented"][-5:]
+    visual_impl = sum(1 for h in recent_impl if _is_visual_suggestion(h.get("text", "")))
+    if recent_impl and visual_impl / len(recent_impl) > 0.5:
+        scores["novelty"] = min(scores.get("novelty", 0), 3)
+
     weighted = sum(scores.get(d["id"], 0) * d["weight"] for d in dims if d["id"] in scores)
     prev     = sm.get("eval_score")
     delta    = f"  Δ {weighted - prev:+.1f}" if prev is not None else ""

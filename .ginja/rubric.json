@@ -1,28 +1,34 @@
 {
-  "version": 1,
+  "version": 2,
   "dimensions": [
+    {
+      "id": "delivery",
+      "label": "Delivery",
+      "weight": 0.30,
+      "question": "Computed mechanically — how much real work shipped this window (operator-goal artifacts, outbox messages)? Not scored by the LLM."
+    },
     {
       "id": "specificity",
       "label": "Specificity",
-      "weight": 0.30,
+      "weight": 0.20,
       "question": "Do reflections reference concrete tools, files, or commands — or are they vague?"
     },
     {
       "id": "groundedness",
       "label": "Groundedness",
-      "weight": 0.25,
+      "weight": 0.20,
       "question": "Are suggestions grounded in data the system actually possesses, not fabricated states?"
     },
     {
       "id": "implementability",
       "label": "Implementability",
-      "weight": 0.25,
+      "weight": 0.15,
       "question": "Could the next-goal be acted on in one session with existing tools?"
     },
     {
       "id": "novelty",
       "label": "Novelty",
-      "weight": 0.20,
+      "weight": 0.15,
       "question": "Does this cycle show forward movement, or repeat previous goals?"
     }
   ]
