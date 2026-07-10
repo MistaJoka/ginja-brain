@@ -83,8 +83,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             elif route == "/api/state":
                 self._send_json(datafeeds.state())
-            elif route == "/api/portrait":
-                self._send_json(datafeeds.portrait())
             elif route == "/api/graph":
                 self._send_json(datafeeds.graph(
                     domain=(q.get("domain") or [None])[0],

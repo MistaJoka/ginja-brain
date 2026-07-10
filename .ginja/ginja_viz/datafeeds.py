@@ -7,6 +7,7 @@ file-parse per TTL window. Stdlib only — urllib, not requests.
 
 import calendar
 import json
+import os
 import re
 import subprocess
 import time
@@ -68,24 +69,22 @@ def _vitals():
     except Exception:
         pass
     try:
+        st = os.statvfs(str(GINJA_DIR))
+        v["disk_used_gb"] = round((st.f_blocks - st.f_bavail) * st.f_frsize / 1e9, 1)
+        v["disk_total_gb"] = round(st.f_blocks * st.f_frsize / 1e9, 1)
+    except Exception:
+        pass
+    try:
+        v["uptime_s"] = float(Path("/proc/uptime").read_text().split()[0])
+    except Exception:
+        pass
+    try:
         raw = (GINJA_DIR / ".inference.lock").read_text().strip()
         v["lock"] = json.loads(raw) if raw else None
     except Exception:
         pass
     _note_lock_transition(v["lock"])
     return v
-
-
-def _portrait_resolved():
-    """Spec + resolved archetype colors, so the web page needs no hex table."""
-    spec = specmod.load_spec()
-    pal = specmod.blended_palette(spec)
-    arches = {k: {"hex": a["hex"], "inspiration": a["inspiration"], "shape": a["shape"],
-                  "jitter": a["jitter"], "pulse_bias": a["pulse_bias"]}
-              for k, a in specmod.ARCHETYPES.items()}
-    return {**spec, "_resolved": {"hex": pal["hex"], "jitter": pal["jitter"],
-                                  "pulse_bias": pal["pulse_bias"]},
-            "_archetypes": arches}
 
 
 _telemetry = None
@@ -111,17 +110,12 @@ def state():
         vitals = _vitals()
         return {
             "self_model": specmod.load_self_model(),
-            "portrait": _portrait_resolved(),
             "vitals": vitals,
             "engines": _engines(vitals),
             "staleness": staleness(),
             "ts": time.time(),
         }
     return _cached("state", 2, _load)
-
-
-def portrait():
-    return _portrait_resolved()
 
 
 # ── Knowledge graph (Qdrant scroll) ─────────────────────────────────────────────
