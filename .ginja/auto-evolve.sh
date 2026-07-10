@@ -49,6 +49,13 @@ WINDOW_DESC="continuous" && [ "${DURATION_HOURS}" != "0" ] && WINDOW_DESC="${DUR
 log "=== Auto-evolution started (${WINDOW_DESC}, ${INTERVAL_MIN}min interval, code-cap 1) ==="
 
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    # ── Log rotation (keep one previous generation, cap ~2MB) ─────────────────
+    for f in "$LOG" "$GINJA_DIR/evolution.log" "$GINJA_DIR/perception.log"; do
+        if [ -f "$f" ] && [ "$(stat -c%s "$f" 2>/dev/null || echo 0)" -gt 2097152 ]; then
+            mv "$f" "$f.1"
+        fi
+    done
+
     CYCLE=$(( CYCLE + 1 ))
     REMAINING_MIN=$(( ( DEADLINE - $(date +%s) ) / 60 ))
     log "--- Cycle #${CYCLE} (${REMAINING_MIN}min remaining) ---"

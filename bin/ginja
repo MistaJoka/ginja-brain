@@ -39,12 +39,8 @@ DEFAULT_CONFIG = {
     "ollama_url": "http://localhost:11434",
     "qdrant_url": "http://localhost:6333",
     "searxng_url": "http://localhost:8080",
-    "gemini_api_key": "",
-    "gemini_model": "gemini-1.5-flash",
-    "gemini_pro_model": "gemini-1.5-pro",
-    "use_gemini_fallback": False,
-    "gemini_for_evolve": True,
-    "gemini_for_implement": True,
+    "deep_code_model": "qwen2.5-coder:7b",
+    "quiet_hours": [0, 7],
     "top_k_memories": 5,
     "save_conversations": True,
     "num_ctx": 2048,
@@ -86,8 +82,6 @@ INGEST_EXTENSIONS = {
 }
 
 console = Console()
-
-_gemini_unavailable: bool = False  # set True within a session when API returns quota/auth errors
 
 
 # ── Resource Manager ───────────────────────────────────────────────────────────
@@ -555,54 +549,20 @@ def ask_with_fallback(prompt: str, cfg: dict, model: str) -> str:
         result = ollama_stream(prompt, m, num_ctx=num_ctx)
         if result:
             return result
-    if cfg.get("use_gemini_fallback") and cfg.get("gemini_api_key"):
-        return ask_gemini(prompt, cfg)
     console.print("[red]All models failed. Is Ollama running?[/red]")
     return ""
 
 
-def gemini_available(cfg: dict) -> bool:
-    return bool(cfg.get("gemini_api_key", "").strip())
-
-
-def gemini_complete(prompt: str, cfg: dict, pro: bool = False, stream: bool = False) -> str:
-    """Call Gemini API using google-genai SDK."""
-    global _gemini_unavailable
-    try:
-        from google import genai
-        client = genai.Client(api_key=cfg["gemini_api_key"])
-        model_name = cfg.get("gemini_pro_model", "gemini-2.0-flash") if pro \
-                     else cfg.get("gemini_model", "gemini-2.0-flash")
-        console.print(f"[dim]model: {model_name}[/dim]")
-        if stream:
-            full = ""
-            for chunk in client.models.generate_content_stream(
-                model=model_name, contents=prompt
-            ):
-                token = chunk.text or ""
-                print(token, end="", flush=True)
-                full += token
-            print()
-            return full
-        else:
-            resp = client.models.generate_content(model=model_name, contents=prompt)
-            return resp.text or ""
-    except Exception as e:
-        err = str(e)
-        if "429" in err or "RESOURCE_EXHAUSTED" in err or "spending cap" in err or "quota" in err.lower():
-            _gemini_unavailable = True
-            console.print("[yellow]⚠ Gemini quota exceeded — switching to local AI for this session[/yellow]")
-        elif any(code in err for code in ("401", "403")) or "API_KEY" in err.upper() or "UNAUTHENTICATED" in err:
-            _gemini_unavailable = True
-            console.print("[yellow]⚠ Gemini auth error — switching to local AI for this session[/yellow]")
-        else:
-            console.print(f"[red]Gemini error: {e}[/red]")
-        return ""
-
-
-def ask_gemini(prompt: str, cfg: dict) -> str:
-    """Legacy streaming ask — kept for backward compat with ask command fallback."""
-    return gemini_complete(prompt, cfg, pro=False, stream=True)
+def _in_quiet_hours(cfg: dict) -> bool:
+    """True when the current hour falls inside quiet_hours [start, end)."""
+    qh = cfg.get("quiet_hours")
+    if not (isinstance(qh, (list, tuple)) and len(qh) == 2):
+        return False
+    start, end = qh
+    hour = datetime.now().hour
+    if start <= end:
+        return start <= hour < end
+    return hour >= start or hour < end  # wraps midnight, e.g. [22, 6]
 
 
 def _resource_pressure() -> str:
@@ -633,46 +593,48 @@ def _resource_pressure() -> str:
     return "normal"
 
 
+def _pick_local_model(use_case: str, cfg: dict, pressure: str = None) -> str:
+    """Choose a local model for the task, respecting the 4GB-GPU budget.
+
+    Daytime inference stays on GPU-resident 3B-4B models. The 7B models
+    (quality_model / deep_code_model) spill to CPU (~4 tok/s) and push the
+    8GB box into swap, so they only load inside quiet_hours under normal
+    pressure — slow overnight thinking is fine, daytime sluggishness isn't.
+    """
+    pressure = pressure or _resource_pressure()
+    if pressure == "critical":
+        return cfg.get("fast_model", cfg["primary_model"])
+
+    deep_ok = pressure == "normal" and _in_quiet_hours(cfg)
+
+    if use_case == "implement":
+        if deep_ok:
+            return cfg.get("deep_code_model", cfg.get("code_model", cfg["primary_model"]))
+        return cfg.get("code_model", cfg["primary_model"])
+    if use_case == "evolve":
+        if deep_ok:
+            return cfg.get("quality_model", cfg["primary_model"])
+        return cfg["primary_model"]
+    return cfg["primary_model"]
+
+
 def smart_complete(prompt: str, cfg: dict, use_case: str = "general",
                    pro: bool = False, fallback_model: str = None) -> str:
-    """Route to Gemini or Ollama based on use_case, config, and current resource pressure.
+    """Route to a local Ollama model based on use_case and resource pressure.
 
-    use_case values:
-      'evolve'    — self-reflection / growth (prefers Gemini if gemini_for_evolve)
-      'implement' — code generation (prefers Gemini if gemini_for_implement)
-      'general'   — follows use_gemini_fallback setting
+    Fully local by design — no cloud path. use_case values:
+      'evolve'    — self-reflection / growth
+      'implement' — code generation
+      'general'   — conversation / misc
 
-    Resource pressure degrades gracefully:
-      'high'     — skip Pro-tier; use flash / primary model
-      'critical' — skip Gemini entirely; use fast model
+    Model choice is delegated to _pick_local_model (7B only in quiet hours;
+    fast model under critical pressure). fallback_model/pro are accepted for
+    backward compatibility but the local budget rule always wins.
     """
-    global _gemini_unavailable
     pressure = _resource_pressure()
-
+    model = _pick_local_model(use_case, cfg, pressure)
     if pressure == "critical":
-        model = cfg.get("fast_model", cfg["primary_model"])
         console.print(f"[dim]⚡ resource:critical — using fast model ({model})[/dim]")
-        return ollama_complete(prompt, model, cfg)
-
-    model = fallback_model or cfg.get("quality_model", cfg["primary_model"])
-    if pressure == "high":
-        model = cfg.get("primary_model")
-        pro   = False
-
-    if not _gemini_unavailable:
-        if use_case == "evolve" and cfg.get("gemini_for_evolve") and gemini_available(cfg):
-            result = gemini_complete(prompt, cfg, pro=pro)
-            if result:
-                return result
-        elif use_case == "implement" and cfg.get("gemini_for_implement") and gemini_available(cfg):
-            result = gemini_complete(prompt, cfg, pro=pro)
-            if result:
-                return result
-        elif use_case == "general" and cfg.get("use_gemini_fallback") and gemini_available(cfg):
-            result = gemini_complete(prompt, cfg, pro=pro, stream=True)
-            if result:
-                return result
-
     return ollama_complete(prompt, model, cfg)
 
 
@@ -1310,16 +1272,13 @@ def status():
     except Exception:
         pass
 
-    # Gemini
-    if gemini_available(cfg):
-        model_name = cfg.get("gemini_model", "gemini-1.5-flash")
-        flags = []
-        if cfg.get("gemini_for_evolve"):   flags.append("evolve")
-        if cfg.get("gemini_for_implement"): flags.append("implement")
-        if cfg.get("use_gemini_fallback"):  flags.append("ask fallback")
-        console.print(f"[green]✓[/green] Gemini  [dim]{model_name}[/dim]  [{', '.join(flags)}]")
-    else:
-        console.print("[dim]–[/dim] Gemini [dim](no key — run: ginja test-gemini after adding to config)[/dim]")
+    # Inference routing (fully local)
+    qh = cfg.get("quiet_hours", [0, 7])
+    console.print(
+        f"[green]✓[/green] Local-only inference  "
+        f"[dim]day: {cfg.get('primary_model')}/{cfg.get('code_model')} · "
+        f"quiet {qh[0]:02d}-{qh[1]:02d}h: {cfg.get('quality_model')}/{cfg.get('deep_code_model')}[/dim]"
+    )
 
     console.print(f"\n[dim]Config:  {CONFIG_FILE}[/dim]")
     console.print(f"[dim]Persona: {'✓' if PERSONA_FILE.exists() else '✗  (edit ~/.ginja/persona.md)'}[/dim]")
@@ -2067,9 +2026,8 @@ def _perceive(cfg: dict) -> str:
 
 
 def _call_oracle_json(prompt: str, cfg: dict) -> dict:
-    """High-value reasoning call — routes to Gemini when available for better quality."""
-    raw = smart_complete(prompt, cfg, use_case="evolve",
-                         fallback_model=cfg.get("quality_model", cfg["primary_model"]))
+    """High-value reasoning call — 7B quality model in quiet hours, 4B otherwise."""
+    raw = smart_complete(prompt, cfg, use_case="evolve")
     start = raw.find("{")
     end   = raw.rfind("}") + 1
     if start >= 0 and end > start:
@@ -2958,8 +2916,7 @@ def _implement_code_suggestion(suggestion_text: str, cfg: dict) -> bool:
         return False
 
     watch_section = original[start_idx:end_idx]
-    model = cfg.get("code_model", cfg.get("quality_model", cfg.get("primary_model", "mistral:7b")))
-    using_gemini = cfg.get("gemini_for_implement") and gemini_available(cfg)
+    model = _pick_local_model("implement", cfg)
 
     # Split section: helper functions preamble + _make_watch_layout body
     func_marker = "def _make_watch_layout("
@@ -3010,7 +2967,7 @@ def _implement_code_suggestion(suggestion_text: str, cfg: dict) -> bool:
     )
 
     def _call_model(prompt):
-        raw = smart_complete(prompt, cfg, use_case="implement", fallback_model=model).strip()
+        raw = smart_complete(prompt, cfg, use_case="implement").strip()
         if raw.startswith("```"):
             raw = "\n".join(l for l in raw.splitlines() if not l.strip().startswith("```"))
         return raw or None
@@ -3048,16 +3005,6 @@ def _implement_code_suggestion(suggestion_text: str, cfg: dict) -> bool:
         new_code = original[:start_idx] + raw + original[end_idx:]
         if _validate_and_write(new_code):
             return True
-
-    # Attempt 3 — Gemini fallback, only when local has failed twice
-    if using_gemini:
-        console.print("  [dim]Local failed twice — escalating to Gemini…[/dim]")
-        raw = _call_model(full_prompt)
-        if raw:
-            new_code = original[:start_idx] + raw + original[end_idx:]
-            if _validate_and_write(new_code):
-                return True
-        console.print("[red]Gemini fallback also failed[/red]")
 
     console.print("[red]Implementation failed — suggestion kept in queue[/red]")
     return False
@@ -3764,47 +3711,6 @@ def watch(refresh):
                 time.sleep(1.0 / refresh)
     except KeyboardInterrupt:
         pass
-
-
-@cli.command("test-gemini")
-def test_gemini():
-    """Verify Gemini API key works and show available models."""
-    cfg = load_config()
-    if not gemini_available(cfg):
-        console.print("[red]No Gemini API key configured.[/red]")
-        console.print(f"[dim]Add it to {CONFIG_FILE}: set gemini_api_key[/dim]")
-        return
-
-    console.print("[dim]Testing Gemini connection…[/dim]")
-    try:
-        from google import genai
-        client = genai.Client(api_key=cfg["gemini_api_key"])
-
-        flash_name = cfg.get("gemini_model", "gemini-2.0-flash")
-        pro_name   = cfg.get("gemini_pro_model", "gemini-2.0-flash")
-
-        # Test Flash
-        resp = client.models.generate_content(model=flash_name, contents="Reply with exactly: ready")
-        if resp.text.strip():
-            console.print(f"[green]✓[/green] {flash_name}  [dim](evolve + ask)[/dim]")
-
-        # Test Pro (only if different model)
-        if pro_name != flash_name:
-            try:
-                resp = client.models.generate_content(model=pro_name, contents="Reply with exactly: ready")
-                if resp.text.strip():
-                    console.print(f"[green]✓[/green] {pro_name}  [dim](implement + deep reasoning)[/dim]")
-            except Exception as e:
-                console.print(f"[yellow]–[/yellow] {pro_name}: {e}")
-
-        console.print("\n[bold green]Gemini is live.[/bold green]")
-        console.print(f"[dim]evolve uses Gemini:    {cfg.get('gemini_for_evolve', False)}[/dim]")
-        console.print(f"[dim]implement uses Gemini: {cfg.get('gemini_for_implement', False)}[/dim]")
-        console.print(f"[dim]ask fallback:          {cfg.get('use_gemini_fallback', False)}[/dim]")
-        console.print(f"\n[dim]Enable more: edit {CONFIG_FILE}[/dim]")
-
-    except Exception as e:
-        console.print(f"[red]✗ Gemini connection failed: {e}[/red]")
 
 
 @cli.command("_set-context", hidden=True)

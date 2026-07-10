@@ -1,6 +1,6 @@
 #!/bin/bash
 # ginja morning brief — writes today.md, a proactive daily digest from ginja to Andre
-# Run daily via cron: 0 8 * * * /home/ginja/.ginja/morning-brief.sh
+# Run daily via cron: 30 7 * * * /home/ginja/.ginja/morning-brief.sh
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
 GINJA="$HOME/bin/ginja"
@@ -12,11 +12,8 @@ ANDRE_MODEL="$GINJA_DIR/andre-model.json"
 PERCEPTION_LOG="$GINJA_DIR/perception.log"
 
 OLLAMA_URL=$(python3 -c "import json; print(json.load(open('$CFG')).get('ollama_url','http://localhost:11434'))" 2>/dev/null || echo "http://localhost:11434")
-FAST_MODEL=$(python3 -c "import json; print(json.load(open('$CFG')).get('fast_model','llama3.2:3b'))" 2>/dev/null || echo "llama3.2:3b")
-QUALITY_MODEL=$(python3 -c "import json; print(json.load(open('$CFG')).get('quality_model','qwen2.5:7b'))" 2>/dev/null || echo "qwen2.5:7b")
-
-GEMINI_KEY=$(python3 -c "import json; print(json.load(open('$CFG')).get('gemini_api_key',''))" 2>/dev/null || echo "")
-GEMINI_MODEL=$(python3 -c "import json; print(json.load(open('$CFG')).get('gemini_model','gemini-2.5-flash'))" 2>/dev/null || echo "gemini-2.5-flash")
+# 4B primary model: brief runs at 07:30 when Andre may be using the box — stay GPU-resident
+PRIMARY_MODEL=$(python3 -c "import json; print(json.load(open('$CFG')).get('primary_model','gemma3:4b'))" 2>/dev/null || echo "gemma3:4b")
 
 echo "[$(date)] Starting morning brief" >> "$LOG"
 
@@ -111,32 +108,9 @@ Write a short morning brief FROM ginja TO Andre. Address him directly. 4 section
 
 Be direct and honest. Not sycophantic. Ginja has its own perspective — use it."
 
-# Try Gemini first, fall back to local
-if [ -n "$GEMINI_KEY" ]; then
-    BRIEF=$(python3 - << PYEOF
-import json, urllib.request, urllib.error
-key = "$GEMINI_KEY"
-model = "$GEMINI_MODEL"
-prompt = """$BRIEF_PROMPT"""
-url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
-req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-try:
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read())
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    print(text.strip())
-except Exception as e:
-    print("")
-PYEOF
-)
-fi
-
-if [ -z "$BRIEF" ]; then
-    BRIEF=$(curl -s "$OLLAMA_URL/api/generate" \
-        -d "{\"model\":\"$QUALITY_MODEL\",\"prompt\":$(echo "$BRIEF_PROMPT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))"),\"stream\":false}" \
-        2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('response',''))" 2>/dev/null)
-fi
+BRIEF=$(curl -s "$OLLAMA_URL/api/generate" \
+    -d "{\"model\":\"$PRIMARY_MODEL\",\"prompt\":$(echo "$BRIEF_PROMPT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))"),\"stream\":false}" \
+    2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('response',''))" 2>/dev/null)
 
 if [ -z "$BRIEF" ]; then
     BRIEF="(Oracle unavailable — homelab health: $HEALTH_SUMMARY)"
@@ -153,6 +127,12 @@ $BRIEF
 MDEOF
 
 echo "[$(date)] Morning brief written to $TODAY_FILE" >> "$LOG"
+
+# Deliver to the outbox — same channel Andre reads replies in
+if [ -d "/mnt/brain/outbox" ] || mkdir -p /mnt/brain/outbox 2>/dev/null; then
+    cp "$TODAY_FILE" /mnt/brain/outbox/today.md 2>/dev/null \
+        && echo "[$(date)] Brief copied to /mnt/brain/outbox/today.md" >> "$LOG"
+fi
 
 # ── 8. Push notification via ntfy (if configured) ──────────────────────────────
 NTFY_TOPIC=$(python3 -c "import json; print(json.load(open('$CFG')).get('ntfy_topic',''))" 2>/dev/null || echo "")
