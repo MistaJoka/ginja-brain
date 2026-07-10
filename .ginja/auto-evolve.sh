@@ -99,11 +99,6 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
         log "suggest-visuals: brain reviewing and auto-implementing watch improvements"
         "$GINJA" suggest-visuals --auto >> "$LOG" 2>&1 \
             && log "suggest-visuals: done" || log "suggest-visuals: FAILED (non-fatal)"
-
-        # Portrait respec — data-only (portrait.json), never code; rate-limited to 6h inside
-        log "portrait: brain redrawing its self-portrait spec"
-        "$GINJA" portrait respec >> "$LOG" 2>&1 \
-            && log "portrait: done" || log "portrait: FAILED (non-fatal)"
     fi
 
     # ── Self-eval (every 5th cycle) ───────────────────────────────────────────

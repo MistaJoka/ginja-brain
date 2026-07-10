@@ -126,7 +126,6 @@ class EngineTelemetry:
         # ── Effector ── freshness of last self-modification artifact
         eage = min(a for a in (_mtime_age(GINJA_DIR / "visual-approved.md"),
                                _mtime_age(GINJA_DIR / "evolution.log"),
-                               _mtime_age(GINJA_DIR / "portrait.json"),
                                9e9) if a is not None)
         self.activities["Effector"] = _age_activity(eage, half_life_s=90 * 60)
         self.detail["Effector"] = (f"last act {int(eage // 60)}m ago"

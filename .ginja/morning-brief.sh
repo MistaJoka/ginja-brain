@@ -116,21 +116,11 @@ if [ -z "$BRIEF" ]; then
     BRIEF="(Oracle unavailable — homelab health: $HEALTH_SUMMARY)"
 fi
 
-# ── 6b. Self-portrait — how ginja sees itself today ────────────────────────────
-PORTRAIT_ARCH=$(python3 -c "import json; p=json.load(open('$GINJA_DIR/portrait.json')); print(p['archetype']['primary'])" 2>/dev/null || echo "")
-PORTRAIT_STMT=$(python3 -c "import json; p=json.load(open('$GINJA_DIR/portrait.json')); print(p.get('artist_statement',''))" 2>/dev/null || echo "")
-PORTRAIT_LINE=""
-if [ -n "$PORTRAIT_ARCH" ] && [ -n "$PORTRAIT_STMT" ]; then
-    PORTRAIT_LINE="**Self-portrait** — today I feel like *${PORTRAIT_ARCH}*: ${PORTRAIT_STMT}"
-fi
-
 # ── 7. Write today.md ──────────────────────────────────────────────────────────
 cat > "$TODAY_FILE" << MDEOF
 # ginja morning brief — $WEEKDAY, $DATE
 
 $BRIEF
-
-${PORTRAIT_LINE}
 
 ---
 *Evo #${EVO_COUNT} · ${PHASE} · ${MOOD} · focus: ${FOCUS}*

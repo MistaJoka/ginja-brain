@@ -1,9 +1,9 @@
-"""ginja_viz — deterministic renderers for ginja-brain's self-portrait.
+"""ginja_viz — the brain's dashboard: live, factual, data-driven views only.
 
 This package lives OUTSIDE /home/ginja/bin/ginja on purpose: the evolution
 loop rewrites `_make_watch_layout` inside that script, and nothing here may
-ever be inside that blast radius. The LLM authors portrait.json (validated
-in spec.py); the code in this package only ever renders it.
+ever be inside that blast radius. Everything served is a measurement over
+state the brain already writes; nothing here is decorative.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

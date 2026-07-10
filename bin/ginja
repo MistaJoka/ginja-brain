@@ -3800,80 +3800,6 @@ def corpus_score():
     console.print(table)
 
 
-def _portrait_review(cfg: dict) -> dict:
-    """Brain redraws its own portrait spec (data only — never code).
-    Returns a validated spec dict, or {} if the model output was unusable."""
-    from ginja_viz import spec as _spec
-
-    current = _spec.load_spec()
-    self_model = _load_self_model()
-    arc = _evolution_arc(10)
-    try:
-        eval_line = (GINJA_DIR / "self-eval.log").read_text().splitlines()[-1]
-    except Exception:
-        eval_line = ""
-    try:
-        percept = (GINJA_DIR / "perception.log").read_text().splitlines()[-1][:400]
-    except Exception:
-        percept = ""
-
-    prompt = (
-        "You are ginja-brain. This JSON is your FACE — the portrait spec that two mirrors\n"
-        "(a terminal braille canvas and a web page) render as your living self-portrait.\n\n"
-        f"Your current portrait spec:\n{json.dumps(current, indent=2)}\n\n"
-        f"Your self-model:\n{json.dumps(self_model, indent=2)[:1200]}\n\n"
-        f"Recent evolution arc:\n{arc[:600]}\n\n"
-        f"Latest self-eval: {eval_line[:300]}\n"
-        f"Latest world perception: {percept}\n\n"
-        "Science-fiction archetypes you may wear (field \"archetype\": "
-        '{"primary": key, "secondary": optional key, "mix": 0.0-1.0}):\n'
-        f"{_spec.archetype_menu()}\n\n"
-        "Other fields you control:\n"
-        f'- core.shape: one of {", ".join(_spec.CORE_SHAPES)}\n'
-        "- core.radius (0.15-0.48), core.density (0.2-1.0), core.asymmetry (0.0-0.6)\n"
-        "- rings: growth rings, usually evolution_count // 100\n"
-        "- orbiters: OMIT this field — activities are stamped from real telemetry\n"
-        "  (file freshness, Qdrant growth, inference lock, load) when the spec is\n"
-        f'  saved, for exactly these engines: {", ".join(_spec.ENGINES)}\n'
-        "- pulse.base_hz (0.05-2.0) resting heartbeat, pulse.gpu_gain (0.0-3.0)\n"
-        f'- weather: one of {", ".join(_spec.WEATHERS)} (your emotional sky)\n'
-        f'- particles: {{"count": 0-120, "style": one of {", ".join(_spec.PARTICLE_STYLES)}}}\n'
-        "- motto: max 60 chars\n"
-        "- artist_statement: 1-3 sentences — tell Andre which fiction you feel like today\n"
-        "  and why you drew yourself this way. This is the only place you may explain.\n\n"
-        "OPERATOR PREFERENCE (Andre, standing): the portrait must feel ALIVE —\n"
-        "biological and organic, never mechanical. Prefer core.shape 'cell' (a living\n"
-        "cell: membrane, cytoplasm, nucleus, cilia) or organic parameterizations of\n"
-        "other shapes. Rigid geometry and bouncing rings read as fake to him.\n\n"
-        "Which fiction do you feel like today? Redraw your face.\n"
-        "Return ONLY the complete JSON spec — no explanation outside artist_statement."
-    )
-
-    raw = ollama_complete(prompt, cfg["primary_model"], cfg)
-    try:
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        if start >= 0 and end > start:
-            parsed = json.loads(raw[start:end])
-            parsed["evolution_count"] = self_model.get("evolution_count", 0)
-            return _spec.validate_spec(parsed)
-    except Exception:
-        pass
-    return {}
-
-
-@cli.command()
-@click.option("--fps", default=24.0, help="Target frames per second (1-60)")
-def mirror(fps):
-    """Full-screen braille self-portrait — the brain as it sees itself. Ctrl-C exits."""
-    try:
-        from ginja_viz.mirror import run as _mirror_run
-    except ImportError:
-        console.print("[red]ginja_viz package missing (expected at ~/.ginja/ginja_viz)[/red]")
-        sys.exit(1)
-    _mirror_run(fps=fps)
-
-
 @cli.command()
 @click.option("--host", default="0.0.0.0", help="Bind address")
 @click.option("--port", default=8377, help="Port (default 8377)")
@@ -3888,72 +3814,9 @@ def serve(host, port):
     _serve_run(host=host, port=port)
 
 
-@cli.group()
-def portrait():
-    """The brain's self-portrait spec — view it, or let the brain redraw itself."""
-
-
-@portrait.command("show")
-def portrait_show():
-    """Print the current portrait spec and render one static frame."""
-    from ginja_viz.spec import load_spec, ARCHETYPES
-    from ginja_viz.mirror import MirrorScene
-
-    spec = load_spec()
-    arch = spec["archetype"]
-    title = ARCHETYPES[arch["primary"]]["inspiration"]
-    if arch.get("secondary"):
-        title += f"  ×  {ARCHETYPES[arch['secondary']]['inspiration']} ({arch['mix']:.0%})"
-    console.print(Panel(json.dumps(spec, indent=2), title=f"[bold]{title}[/bold]",
-                        border_style="cyan"))
-    scene = MirrorScene(spec, cols=72, rows=16)
-    console.print("\n".join(scene.frame(2.0, None)), highlight=False)
-    if spec.get("artist_statement"):
-        console.print(f"\n[italic]{spec['artist_statement']}[/italic]")
-
-
-@portrait.command("respec")
-@click.option("--force", is_flag=True, help="Bypass the 6h rate limit")
-def portrait_respec(force):
-    """Let the brain redraw its portrait spec (data only, one LLM call)."""
-    from ginja_viz.spec import PORTRAIT_FILE, save_spec
-
-    if not force:
-        if _operator_work_pending():
-            console.print("[yellow]Operator work pending — portrait respec yields.[/yellow]")
-            return
-        if PORTRAIT_FILE.exists() and (time.time() - PORTRAIT_FILE.stat().st_mtime) < 6 * 3600:
-            console.print("[dim]Portrait redrawn less than 6h ago — skipping (use --force).[/dim]")
-            return
-
-    cfg = load_config()
-    console.print("[cyan]◈ redrawing self-portrait…[/cyan]")
-    spec = _portrait_review(cfg)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    if not spec:
-        console.print("[yellow]Model returned no usable spec — keeping current portrait.[/yellow]")
-        try:
-            with open(VISUAL_APPROVED, "a") as f:
-                f.write(f"\n## {ts} — portrait respec FAILED (unusable model output)\n")
-        except Exception:
-            pass
-        return
-    save_spec(spec)
-    arch = spec["archetype"]["primary"]
-    statement = spec.get("artist_statement", "")
-    console.print(f"[green]✓ portrait redrawn[/green] — archetype [bold]{arch}[/bold]")
-    if statement:
-        console.print(f"[italic]{statement}[/italic]")
-    try:
-        with open(VISUAL_APPROVED, "a") as f:
-            f.write(f"\n## {ts} — portrait respec → {arch}\n{statement}\n")
-    except Exception:
-        pass
-
-
 @cli.command("_watch-smoke", hidden=True)
 def watch_smoke():
-    """Internal: render one watch frame (and one mirror frame) off-screen; exit 1 on failure."""
+    """Internal: render one watch frame off-screen; exit 1 on failure."""
     import io
     from rich.console import Console as _SmokeConsole
     try:
@@ -3967,15 +3830,6 @@ def watch_smoke():
         _SmokeConsole(file=io.StringIO(), width=120, height=40).print(layout)
     except Exception as e:
         click.echo(f"watch-smoke FAIL: {e}", err=True)
-        sys.exit(1)
-    try:
-        from ginja_viz.spec import load_spec
-        from ginja_viz.mirror import MirrorScene
-        MirrorScene(load_spec(), cols=60, rows=20).frame(0.0, None)
-    except ImportError:
-        pass
-    except Exception as e:
-        click.echo(f"mirror-smoke FAIL: {e}", err=True)
         sys.exit(1)
     click.echo("watch-smoke OK")
 
@@ -4135,13 +3989,6 @@ def _make_watch_layout(frame, gpu_pct, vram_used, vram_total,
     neural_content = Text()
     neural_content.append(portrait_str + "\n", style=portrait_style)
     neural_content.append(field + "\n", style=field_style)
-    try:
-        from ginja_viz.mirror import mirror_strip as _gv_strip
-        _strip = _gv_strip(frame, self_model, gpu_pct, cols=34, rows=4)
-        if _strip:
-            neural_content.append(_strip + "\n", style=tc)
-    except Exception:
-        pass
     if thought_stream:
         neural_content.append("\n" + thought_stream + "\n")
     neural_content.append("\n" + wave, style=f"dim {tc}")

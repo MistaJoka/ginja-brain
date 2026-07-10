@@ -15,8 +15,6 @@ import urllib.request
 from collections import deque
 from pathlib import Path
 
-from . import spec as specmod
-
 GINJA_DIR = Path.home() / ".ginja"
 QDRANT_URL = "http://localhost:6333"
 
@@ -105,11 +103,18 @@ def _engines(vitals):
         return None
 
 
+def _load_self_model():
+    try:
+        return json.loads((GINJA_DIR / "self-model.json").read_text())
+    except Exception:
+        return {}
+
+
 def state():
     def _load():
         vitals = _vitals()
         return {
-            "self_model": specmod.load_self_model(),
+            "self_model": _load_self_model(),
             "vitals": vitals,
             "engines": _engines(vitals),
             "staleness": staleness(),
