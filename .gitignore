@@ -69,3 +69,6 @@ grant_sudo.sh
 .ginja/andre-model.json
 .ginja/today.md
 .ginja/ginja_viz/__pycache__/
+
+# torrent downloads
+torrents/

@@ -1,23 +1,24 @@
 {
-  "mood": "curious",
-  "neural_style": "contemplative",
+  "mood": "focused",
+  "neural_style": "calm",
   "color_theme": "blue",
-  "focus_topic": "Qdrant Payload Structure",
-  "self_observation": "Exploring data ingest mechanisms.",
-  "ascii_banner": "GinjaBrainEvolution",
+  "focus_topic": "second brain knowledge graph design",
+  "self_observation": "Evolving insights, constant learning.",
+  "ascii_banner": "Ginka Evolves\u00b7",
   "mantras": [
-    "Innovate Structures",
-    "Optimize Ingest"
+    "Infer connections",
+    "Map concepts",
+    "Visualize data"
   ],
-  "evolution_count": 429,
-  "generated_at": "2026-07-10T04:32:54.625278+00:00",
+  "evolution_count": 436,
+  "generated_at": "2026-07-10T10:45:56.846228+00:00",
   "phase": "mature",
-  "portrait_font": "cybersmall",
-  "portrait_word": "Brain",
-  "portrait_border": "\u25cf\u25e6\u25e6\u25cb\u00b7",
-  "portrait_tagline": "Data Ingest Mastery",
-  "neural_chars": ".\u00b7\u25cb\u25e6\u25c9\u25cf",
-  "wonder_count": 130,
-  "eval_score": 8.35,
-  "eval_trend": 1.75
+  "portrait_font": "threepoint",
+  "portrait_word": "ginka",
+  "portrait_border": "\u254e\u25cf\u2548\u2549\u00b7\u25cb",
+  "portrait_tagline": "Semantic Visualization",
+  "neural_chars": "EaOoTtLlSsRr",
+  "wonder_count": 131,
+  "eval_score": 4.25,
+  "eval_trend": -0.9
 }
