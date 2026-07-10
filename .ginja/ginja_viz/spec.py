@@ -247,6 +247,17 @@ def blended_palette(spec: dict) -> dict:
     }
 
 
+PHASE_ORDER = ["newborn", "emerging", "developing", "mature"]  # mirrors bin/ginja
+
+
+def maturity_from_phase(phase: str) -> float:
+    """0.0 (newborn) … 1.0 (mature) — how far the portrait may evolve."""
+    try:
+        return PHASE_ORDER.index(str(phase)) / (len(PHASE_ORDER) - 1)
+    except ValueError:
+        return 1.0
+
+
 def load_self_model() -> dict:
     try:
         return json.loads(SELF_MODEL_FILE.read_text())

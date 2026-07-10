@@ -173,6 +173,17 @@ const ENGINE_GLYPHS = { Memory:"M", Cognition:"C", Perception:"P", Effector:"E",
                         Drive:"D", Safety:"S", Spine:"◆" };
 
 let spec = null, vitals = { gpu_pct: 0, lock: null }, selfModel = {}, engines = null;
+// development replays over ~75s each visit, capped by the brain's real phase;
+// ?m=0..1 in the URL pins the morph stage (0 = cell, 1 = human)
+const PHASES = ["newborn", "emerging", "developing", "mature"];
+const mPin = parseFloat(new URLSearchParams(location.search).get("m"));
+function morphM(t) {
+  if (!isNaN(mPin)) return Math.max(0, Math.min(1, mPin));
+  const i = PHASES.indexOf(selfModel.phase || "mature");
+  const cap = i < 0 ? 1 : i / (PHASES.length - 1);
+  const x = Math.min(1, t / 75);
+  return cap * x * x * (3 - 2 * x);
+}
 // live activity for an engine: real telemetry when present, spec fallback
 const engineAct = o => (engines && engines.activity && engines.activity[o.engine] != null)
   ? engines.activity[o.engine] : o.activity;
@@ -233,64 +244,127 @@ function core(ctx, t, cx, cy, R, gpu, hx) {
   ctx.fillStyle = hx.primary; ctx.strokeStyle = hx.primary; ctx.lineWidth = 1.5;
   glow(ctx, hx.primary, 14);
   if (shape === "cell") {
-    const memR = a => R * (1
-      + 0.20 * Math.sin(2 * a + t * 0.90)
-      + 0.13 * Math.sin(3 * a - t * 0.63 + 1.7)
-      + (0.08 + asym * 0.06) * Math.sin(5 * a + t * 1.15 + 4.0)
-      + 0.04 * Math.sin(9 * a - t * 1.90));
-    // membrane
+    // a lifeform that EVOLVES: cell → elongation → limb buds → human.
+    // replays development each session, capped by the brain's real phase
+    const mph = morphM(t);
+    const mT = mph;
+    const mL = Math.max(0, Math.min(1, (mph - 0.45) / 0.55));
+    const mh = Math.max(0, Math.min(1, (mph - 0.50) / 0.35));
+
+    const amp = 1 - 0.55 * mph;
+    const sx = 1 - 0.32 * mph, sy = 1 + 0.62 * mph;
+    const S = R * 1.55;
+    const memCy = cy + 0.07 * S * mph;
+
+    const memF = a => 1
+      + amp * 0.20 * Math.sin(2 * a + t * 0.90)
+      + amp * 0.13 * Math.sin(3 * a - t * 0.63 + 1.7)
+      + amp * (0.08 + asym * 0.06) * Math.sin(5 * a + t * 1.15 + 4.0)
+      + amp * 0.04 * Math.sin(9 * a - t * 1.90);
+    const memXY = (a, frac = 1) => {
+      const f = memF(a) * frac;
+      return [cx + R * sx * f * Math.cos(a), memCy + R * sy * f * Math.sin(a)];
+    };
+
+    // aura membrane
     ctx.beginPath();
-    const nMem = 160;
-    for (let i = 0; i <= nMem; i++) {
-      const a = TAU * i / nMem, r = memR(a);
-      const x = cx + r * Math.cos(a), y = cy + r * Math.sin(a);
+    for (let i = 0; i <= 160; i++) {
+      const [x, y] = memXY(TAU * i / 160);
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     }
     ctx.lineWidth = 2; ctx.stroke();
     ctx.fillStyle = hx.primary + "10"; ctx.fill();
-    // cilia
+
+    // cilia fade away as the organism outgrows them
     ctx.strokeStyle = hx.secondary + "aa"; ctx.lineWidth = 1;
-    for (let k = 0; k < 26; k++) {
-      const a = TAU * k / 26 + 0.12 * Math.sin(t * 0.7 + k);
-      const r0 = memR(a), sway = 0.55 * Math.sin(t * 2.1 + k * 1.9 + hash(k) * TAU);
+    const nCil = Math.floor(26 * (1 - mph));
+    for (let k = 0; k < nCil; k++) {
+      const a = TAU * k / Math.max(1, nCil) + 0.12 * Math.sin(t * 0.7 + k);
+      const sway = 0.55 * Math.sin(t * 2.1 + k * 1.9 + hash(k) * TAU);
       const ln = 5 + 6 * hash(k * 3.3);
-      ctx.beginPath();
-      ctx.moveTo(cx + r0 * Math.cos(a), cy + r0 * Math.sin(a));
-      ctx.lineTo(cx + (r0 + ln) * Math.cos(a + sway * 0.25),
-                 cy + (r0 + ln) * Math.sin(a + sway * 0.25));
-      ctx.stroke();
+      const [x0, y0] = memXY(a);
+      const [x1, y1] = memXY(a + sway * 0.03, 1 + ln / R);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
     }
-    // nucleus: its own morphing membrane, wandering on layered rhythms
-    const nx = cx + R * 0.20 * (Math.sin(t * 0.23 + 1.1) + 0.5 * Math.sin(t * 0.111 + 4.2));
-    const ny = cy + R * 0.16 * (Math.sin(t * 0.17) + 0.5 * Math.sin(t * 0.087 + 2.6));
-    const nr = R * 0.24;
+
+    // skeleton (body units: ~1.5 tall, y down)
+    const swayB = (0.04 * Math.sin(t * 0.31) + 0.02 * Math.sin(t * 0.53)) * mph;
+    const breathe = 1 + 0.015 * Math.sin(t * 0.8 + Math.sin(t * 0.13));
+    const lean = 0.03 * Math.sin(t * 0.23) * mph;
+    const P = p => [cx + p[0] * S, memCy + p[1] * S];
+    const trunk = 0.55 * mT * breathe;
+    const pelvis = [swayB, 0.18];
+    const neck = [swayB + lean, pelvis[1] - trunk];
+    const headC = [neck[0] + lean * 0.5, neck[1] - 0.16 * mT];
+    const shw = 0.17 * (0.4 + 0.6 * mT), hipw = 0.10 * (0.5 + 0.5 * mT);
+    const shL = [neck[0] - shw, neck[1] + 0.02], shR = [neck[0] + shw, neck[1] + 0.02];
+    const hipL = [pelvis[0] - hipw, pelvis[1]], hipR = [pelvis[0] + hipw, pelvis[1]];
+    const bones = [[pelvis, neck, 0.085], [shL, shR, 0.05], [hipL, hipR, 0.06]];
+    for (const [s, sh] of [[-1, shL], [1, shR]]) {
+      const el = [sh[0] + s * (0.10 + 0.03 * Math.sin(t * 0.42 + s)) * mL, sh[1] + 0.22 * mL];
+      const ha = [el[0] + s * (0.03 + 0.03 * Math.sin(t * 0.66 + 2 * s)) * mL, el[1] + 0.22 * mL];
+      bones.push([sh, el, 0.05], [el, ha, 0.04]);
+    }
+    for (const [s, hip] of [[-1, hipL], [1, hipR]]) {
+      const kn = [hip[0] + s * 0.02 * mL + 0.02 * Math.sin(t * 0.5 + s) * mL, hip[1] + 0.30 * mL];
+      const ft = [kn[0] + s * 0.03 * mL, kn[1] + 0.32 * mL];
+      bones.push([hip, kn, 0.06], [kn, ft, 0.05]);
+    }
+    if (mph > 0.35) {
+      ctx.strokeStyle = hx.secondary + "44"; ctx.lineWidth = 1.5;
+      for (const [p0, p1] of bones) {
+        const [x0, y0] = P(p0), [x1, y1] = P(p1);
+        ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      }
+    }
+
+    // nucleus → head: migrates up, rounds off, becomes the mind
+    const wx = cx + R * 0.20 * (Math.sin(t * 0.23 + 1.1) + 0.5 * Math.sin(t * 0.111 + 4.2));
+    const wy = memCy + R * 0.16 * (Math.sin(t * 0.17) + 0.5 * Math.sin(t * 0.087 + 2.6));
+    const [hpx, hpy] = P(headC);
+    const ncx = wx + (hpx - wx) * mh, ncy = wy + (hpy - wy) * mh;
+    const nr = (1 - mh) * 0.24 * R + mh * 0.13 * S;
+    const namp = 1 - 0.65 * mh;
     const nucR = a => nr * (1
-      + 0.18 * Math.sin(2 * a - t * 0.74 + 2.3)
-      + 0.12 * Math.sin(3 * a + t * 1.07)
-      + 0.06 * Math.sin(5 * a - t * 1.51 + 5.1));
-    const grad = ctx.createRadialGradient(nx, ny, nr * 0.1, nx, ny, nr * 1.4);
+      + namp * 0.18 * Math.sin(2 * a - t * 0.74 + 2.3)
+      + namp * 0.12 * Math.sin(3 * a + t * 1.07)
+      + namp * 0.06 * Math.sin(5 * a - t * 1.51 + 5.1));
+    const grad = ctx.createRadialGradient(ncx, ncy, nr * 0.1, ncx, ncy, nr * 1.4);
     grad.addColorStop(0, hx.accent + "cc");
     grad.addColorStop(1, hx.primary + "22");
     ctx.fillStyle = grad;
     ctx.beginPath();
-    const nSteps = 60;
-    for (let i = 0; i <= nSteps; i++) {
-      const a = TAU * i / nSteps, r = nucR(a);
-      const x = nx + r * Math.cos(a), y = ny + r * Math.sin(a);
+    for (let i = 0; i <= 60; i++) {
+      const a = TAU * i / 60, r = nucR(a);
+      const x = ncx + r * Math.cos(a), y = ncy + r * Math.sin(a);
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     }
     ctx.fill();
-    // cytoplasm: particles on wobbly streamlines, clipped to the membrane
+
+    // particles migrate: cytoplasm swirl → flesh on the skeleton
     const nCyt = 70 + 150 * den;
     for (let i = 0; i < nCyt; i++) {
       const h1 = hash(i * 1.9), h2 = hash(i * 5.3);
+      const h3 = hash(i * 7.7), h4 = hash(i * 3.7);
+      const wgt = Math.max(0, Math.min(1, (mph - 0.30 - 0.45 * h3) / 0.22));
       const w = 0.06 + 0.22 * h2;
       const a = TAU * h1 + t * w * (1 + 0.35 * Math.sin(t * 0.21 + i));
       const frac = 0.30 + 0.62 * (h2 ** 0.7) + 0.05 * Math.sin(t * 0.6 + i * 2.2);
-      const r = memR(a) * Math.min(0.93, frac);
+      const [cxp, cyp] = memXY(a, Math.min(0.93, frac));
+      let x = cxp, y = cyp;
+      if (wgt > 0) {
+        const bone = bones[Math.floor(h1 * bones.length) % bones.length];
+        const [p0, p1, bw] = bone;
+        const u = h2;
+        const bxu = p0[0] + (p1[0] - p0[0]) * u, byu = p0[1] + (p1[1] - p0[1]) * u;
+        const dx = p1[0] - p0[0], dy = p1[1] - p0[1];
+        const ln = Math.sqrt(dx * dx + dy * dy) || 1;
+        const off = bw * (h4 * 2 - 1) * (1 + 0.15 * Math.sin(t * 0.9 + i));
+        const [fx, fy] = P([bxu - dy / ln * off, byu + dx / ln * off]);
+        x = cxp + (fx - cxp) * wgt; y = cyp + (fy - cyp) * wgt;
+      }
       ctx.fillStyle = h2 > 0.5 ? hx.secondary + "99" : hx.primary + "77";
-      ctx.beginPath();
-      ctx.arc(cx + r * Math.cos(a), cy + r * Math.sin(a), 1.4, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y, 1.4, 0, TAU); ctx.fill();
     }
   } else if (shape === "eye") {
     ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.stroke();

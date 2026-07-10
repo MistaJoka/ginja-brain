@@ -141,8 +141,10 @@ class LiveSignals:
 # ── Scene ───────────────────────────────────────────────────────────────────────
 
 class MirrorScene:
-    def __init__(self, spec: dict, cols: int, rows: int):
+    def __init__(self, spec: dict, cols: int, rows: int, maturity: float = 1.0):
         self.spec = spec
+        self.maturity = max(0.0, min(1.0, maturity))
+        self._m = 0.0
         self.cols, self.rows = max(20, cols), max(3, rows)
         self.pal = specmod.blended_palette(spec)
         self.dim = BrailleCanvas(self.cols, self.rows)
@@ -166,6 +168,9 @@ class MirrorScene:
         R = s["core"]["radius"] * min(self.W, self.H / self.aspect)
         # no body pulsing (Andre's call) — life shows in the membrane morph instead
         pulse = 1.0
+        # development replays each session over ~75 s, capped by real phase
+        x = min(1.0, t / 75.0)
+        self._m = self.maturity * (x * x * (3 - 2 * x))
         jit = self.pal["jitter"]
         jx = jit * R * 0.15 * math.sin(t * 2.1)
         jy = jit * R * 0.10 * math.sin(t * 3.3 + 1.0)
@@ -215,66 +220,142 @@ class MirrorScene:
         b, m = self.bright, self.mid
 
         if shape == "cell":
-            # ── a living cell: morphing membrane, cytoplasm flow, nucleus, cilia ──
+            # ── a lifeform that EVOLVES: cell → elongation → limb buds → human ──
+            # morph m ∈ [0,1]: replays development each session, capped by the
+            # brain's real phase (newborn stays a cell; mature becomes humanoid)
+            mph = self._m
+            mT = mph                                          # trunk/elongation
+            mL = max(0.0, min(1.0, (mph - 0.45) / 0.55))      # limb growth
+            mh = max(0.0, min(1.0, (mph - 0.50) / 0.35))      # nucleus → head
+
+            # aura/membrane: the amoeba wall stretches tall and calms as it grows
+            amp = 1.0 - 0.55 * mph
+            sx = 1.0 - 0.32 * mph
+            sy = 1.0 + 0.62 * mph
+            mem_cy = cy + 0.07 * R * 1.55 * self.aspect * mph
+
             def membrane_r(a):
-                return R * (1.0
-                            + 0.20 * math.sin(2 * a + t * 0.90)
-                            + 0.13 * math.sin(3 * a - t * 0.63 + 1.7)
-                            + (0.08 + asym * 0.06) * math.sin(5 * a + t * 1.15 + 4.0)
-                            + 0.04 * math.sin(9 * a - t * 1.90))
-            # membrane: double-sampled dotted wall
+                return (1.0
+                        + amp * 0.20 * math.sin(2 * a + t * 0.90)
+                        + amp * 0.13 * math.sin(3 * a - t * 0.63 + 1.7)
+                        + amp * (0.08 + asym * 0.06) * math.sin(5 * a + t * 1.15 + 4.0)
+                        + amp * 0.04 * math.sin(9 * a - t * 1.90))
+
+            def mem_xy(a, frac=1.0):
+                f = membrane_r(a) * frac
+                return (cx + R * sx * f * math.cos(a),
+                        mem_cy + R * sy * f * math.sin(a) * self.aspect)
+
             n_mem = int(140 + 160 * density)
             for i in range(n_mem):
                 a = TAU * i / n_mem
-                r = membrane_r(a)
-                x, y = self._xy(cx, cy, r, a)
+                x, y = mem_xy(a)
                 b.plot(int(x), int(y))
                 if i % 2 == 0:
-                    x2, y2 = self._xy(cx, cy, r - 1.5, a)
+                    x2, y2 = mem_xy(a, 0.97)
                     m.plot(int(x2), int(y2))
-            # cilia: short waving hairs on the membrane
-            n_cil = 26
+
+            # cilia fade away as the organism outgrows them
+            n_cil = int(26 * (1.0 - mph))
             for k in range(n_cil):
-                a = TAU * k / n_cil + 0.12 * math.sin(t * 0.7 + k)
-                r0 = membrane_r(a)
+                a = TAU * k / max(1, n_cil) + 0.12 * math.sin(t * 0.7 + k)
                 sway = 0.55 * math.sin(t * 2.1 + k * 1.9 + _hash(k) * TAU)
                 ln = 2.5 + 2.5 * _hash(k * 3.3)
-                x0, y0 = self._xy(cx, cy, r0, a)
-                x1, y1 = self._xy(cx, cy, r0 + ln, a + sway * 0.25)
+                x0, y0 = mem_xy(a)
+                x1, y1 = mem_xy(a + sway * 0.03, 1.0 + ln / R)
                 m.line(x0, y0, x1, y1)
-            # nucleus: its own morphing membrane, wandering on layered rhythms
-            nx = cx + R * 0.20 * (math.sin(t * 0.23 + 1.1) + 0.5 * math.sin(t * 0.111 + 4.2))
-            ny = cy + R * 0.16 * (math.sin(t * 0.17) + 0.5 * math.sin(t * 0.087 + 2.6)) * self.aspect
-            nr = R * 0.24
+
+            # ── skeleton (body units: x right, y down, ~1.5 units tall) ──
+            S = R * 1.55
+            sway = (0.04 * math.sin(t * 0.31) + 0.02 * math.sin(t * 0.53)) * mph
+            breathe = 1 + 0.015 * math.sin(t * 0.8 + math.sin(t * 0.13))
+            lean = 0.03 * math.sin(t * 0.23) * mph
+
+            def P(pt):
+                return (cx + pt[0] * S, mem_cy + pt[1] * S * self.aspect)
+
+            trunk = 0.55 * mT * breathe
+            pelvis = (sway, 0.18)
+            neck = (sway + lean, pelvis[1] - trunk)
+            head_c = (neck[0] + lean * 0.5, neck[1] - 0.16 * mT)
+            shw = 0.17 * (0.4 + 0.6 * mT)
+            hipw = 0.10 * (0.5 + 0.5 * mT)
+            shL = (neck[0] - shw, neck[1] + 0.02)
+            shR = (neck[0] + shw, neck[1] + 0.02)
+            hipL = (pelvis[0] - hipw, pelvis[1])
+            hipR = (pelvis[0] + hipw, pelvis[1])
+            bones = [(pelvis, neck, 0.085), (shL, shR, 0.05), (hipL, hipR, 0.06)]
+            for s, sh in ((-1, shL), (1, shR)):
+                el = (sh[0] + s * (0.10 + 0.03 * math.sin(t * 0.42 + s)) * mL,
+                      sh[1] + 0.22 * mL)
+                ha = (el[0] + s * (0.03 + 0.03 * math.sin(t * 0.66 + 2 * s)) * mL,
+                      el[1] + 0.22 * mL)
+                bones += [(sh, el, 0.05), (el, ha, 0.04)]
+            for s, hip in ((-1, hipL), (1, hipR)):
+                kn = (hip[0] + s * 0.02 * mL + 0.02 * math.sin(t * 0.5 + s) * mL,
+                      hip[1] + 0.30 * mL)
+                ft = (kn[0] + s * 0.03 * mL, kn[1] + 0.32 * mL)
+                bones += [(hip, kn, 0.06), (kn, ft, 0.05)]
+
+            if mph > 0.35:
+                for p0, p1, _w in bones:
+                    x0, y0 = P(p0)
+                    x1, y1 = P(p1)
+                    self.dim.line(x0, y0, x1, y1)
+
+            # ── nucleus → head: migrates up, rounds off, becomes the mind ──
+            wx = cx + R * 0.20 * (math.sin(t * 0.23 + 1.1) + 0.5 * math.sin(t * 0.111 + 4.2))
+            wy = mem_cy + R * 0.16 * (math.sin(t * 0.17) + 0.5 * math.sin(t * 0.087 + 2.6)) * self.aspect
+            hx_px, hy_px = P(head_c)
+            ncx = wx + (hx_px - wx) * mh
+            ncy = wy + (hy_px - wy) * mh
+            nr = (1 - mh) * 0.24 * R + mh * 0.13 * S
+            namp = 1.0 - 0.65 * mh
 
             def nucleus_r(a):
                 return nr * (1.0
-                             + 0.18 * math.sin(2 * a - t * 0.74 + 2.3)
-                             + 0.12 * math.sin(3 * a + t * 1.07)
-                             + 0.06 * math.sin(5 * a - t * 1.51 + 5.1))
+                             + namp * 0.18 * math.sin(2 * a - t * 0.74 + 2.3)
+                             + namp * 0.12 * math.sin(3 * a + t * 1.07)
+                             + namp * 0.06 * math.sin(5 * a - t * 1.51 + 5.1))
             n_wall = int(40 + 50 * density)
             for i in range(n_wall):
                 a = TAU * i / n_wall
-                x, y = self._xy(nx, ny, nucleus_r(a), a)
+                x, y = self._xy(ncx, ncy, nucleus_r(a), a)
                 b.plot(int(x), int(y))
             n_nuc = int(40 + 60 * density)
             for i in range(n_nuc):
                 a = TAU * _hash(i * 4.1) + t * 0.07
                 rr = nucleus_r(a) * (_hash(i * 2.7) ** 0.6)
-                x, y = self._xy(nx, ny, rr, a)
+                x, y = self._xy(ncx, ncy, rr, a)
                 (b if rr > nr * 0.7 else m).plot(int(x), int(y))
-            # cytoplasm: particles advected on wobbly closed streamlines,
-            # clipped to the membrane so they inherit its shape
+
+            # ── particles migrate: cytoplasm swirl → flesh on the skeleton ──
             n_cyt = int(70 + 150 * density)
             for i in range(n_cyt):
                 h1, h2 = _hash(i * 1.9), _hash(i * 5.3)
-                w = 0.06 + 0.22 * h2                       # per-particle drift rate
+                h3, h4 = _hash(i * 7.7), _hash(i * 3.7)
+                wgt = max(0.0, min(1.0, (mph - 0.30 - 0.45 * h3) / 0.22))
+                # cytoplasm position (amoeba interior)
+                w = 0.06 + 0.22 * h2
                 a = TAU * h1 + t * w * (1 + 0.35 * math.sin(t * 0.21 + i))
                 frac = 0.30 + 0.62 * (h2 ** 0.7) + 0.05 * math.sin(t * 0.6 + i * 2.2)
-                r = membrane_r(a) * min(0.93, frac)
-                x, y = self._xy(cx, cy, r, a)
+                cxp, cyp = mem_xy(a, min(0.93, frac))
+                if wgt <= 0.0:
+                    m.plot(int(cxp), int(cyp))
+                    continue
+                # flesh position: a point along a bone + breathing-shimmer offset
+                bone = bones[int(h1 * len(bones)) % len(bones)]
+                (p0, p1, bw) = bone
+                u = h2
+                bx = p0[0] + (p1[0] - p0[0]) * u
+                by = p0[1] + (p1[1] - p0[1]) * u
+                dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+                ln = math.sqrt(dx * dx + dy * dy) or 1.0
+                off = bw * (h4 * 2 - 1) * (1.0 + 0.15 * math.sin(t * 0.9 + i))
+                fx, fy = P((bx - dy / ln * off, by + dx / ln * off))
+                x = cxp + (fx - cxp) * wgt
+                y = cyp + (fy - cyp) * wgt
                 m.plot(int(x), int(y))
-
         elif shape == "eye":
             b.ellipse(cx, cy, R, R * self.aspect)
             b.ellipse(cx, cy, R - 1, (R - 1) * self.aspect)
@@ -559,7 +640,8 @@ def mirror_strip(frame: int, self_model: dict, gpu_pct: int,
     scene = _strip_cache.get(key)
     spec_mtime = specmod.PORTRAIT_FILE.stat().st_mtime if specmod.PORTRAIT_FILE.exists() else 0
     if scene is None or scene[1] != spec_mtime:
-        scene = (MirrorScene(specmod.load_spec(), cols, rows), spec_mtime)
+        # strips are tiny — stay at the cell stage, a humanoid would be unreadable
+        scene = (MirrorScene(specmod.load_spec(), cols, rows, maturity=0.0), spec_mtime)
         _strip_cache[key] = scene
     try:
         raw = INFERENCE_LOCK.read_text().strip()
@@ -577,7 +659,8 @@ def run(fps: float = 24.0):
     cols, rows = size.columns, max(8, size.lines - 5)  # 4 status + 1 spare
 
     spec = specmod.load_spec()
-    scene = MirrorScene(spec, cols, rows)
+    maturity = specmod.maturity_from_phase(specmod.load_self_model().get("phase", "mature"))
+    scene = MirrorScene(spec, cols, rows, maturity=maturity)
     signals = LiveSignals().start()
     spec_mtime = specmod.PORTRAIT_FILE.stat().st_mtime if specmod.PORTRAIT_FILE.exists() else 0
     last_spec_check = 0.0
@@ -594,7 +677,7 @@ def run(fps: float = 24.0):
                 mt = specmod.PORTRAIT_FILE.stat().st_mtime if specmod.PORTRAIT_FILE.exists() else 0
                 if mt != spec_mtime:
                     spec_mtime = mt
-                    scene = MirrorScene(specmod.load_spec(), cols, rows)
+                    scene = MirrorScene(specmod.load_spec(), cols, rows, maturity=maturity)
             rows_ansi = scene.frame_ansi(t, signals)
             rows_ansi += scene.status_lines(signals)
             out.write("\x1b[H" + "\x1b[K\r\n".join(rows_ansi) + "\x1b[K")
