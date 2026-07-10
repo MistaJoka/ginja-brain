@@ -164,10 +164,8 @@ class MirrorScene:
         s = self.spec
         cx, cy = self.W / 2, self.H / 2
         R = s["core"]["radius"] * min(self.W, self.H / self.aspect)
-        pulse_hz = max(0.05, s["pulse"]["base_hz"] + self.pal["pulse_bias"]
-                       + s["pulse"]["gpu_gain"] * gpu)
-        # heartbeat (lub-dub) modulated by breath — organic, not sinusoidal
-        pulse = _breath(t) * (1.0 + (0.06 + 0.06 * gpu) * _heartbeat(t * pulse_hz))
+        # no body pulsing (Andre's call) — life shows in the membrane morph instead
+        pulse = 1.0
         jit = self.pal["jitter"]
         jx = jit * R * 0.15 * math.sin(t * 2.1)
         jy = jit * R * 0.10 * math.sin(t * 3.3 + 1.0)
@@ -179,7 +177,6 @@ class MirrorScene:
                      for o in s["orbiters"]] if live else s["orbiters"])
 
         self._weather(t, s["weather"])
-        self._rings(cx, cy, R, s["rings"], t)
         self._core(s["core"], t, cx, cy, R * pulse, gpu)
         overlay = self._orbiters(orbiters, t, cx, cy, R)
         self._particles(s["particles"], t, cx, cy, R)
@@ -221,10 +218,10 @@ class MirrorScene:
             # ── a living cell: morphing membrane, cytoplasm flow, nucleus, cilia ──
             def membrane_r(a):
                 return R * (1.0
-                            + 0.10 * math.sin(2 * a + t * 0.41)
-                            + 0.065 * math.sin(3 * a - t * 0.29 + 1.7)
-                            + (0.045 + asym * 0.05) * math.sin(5 * a + t * 0.53 + 4.0)
-                            + 0.02 * math.sin(9 * a - t * 0.9))
+                            + 0.20 * math.sin(2 * a + t * 0.90)
+                            + 0.13 * math.sin(3 * a - t * 0.63 + 1.7)
+                            + (0.08 + asym * 0.06) * math.sin(5 * a + t * 1.15 + 4.0)
+                            + 0.04 * math.sin(9 * a - t * 1.90))
             # membrane: double-sampled dotted wall
             n_mem = int(140 + 160 * density)
             for i in range(n_mem):
@@ -248,7 +245,7 @@ class MirrorScene:
             # nucleus: soft pulsing blob that slowly wanders off-center
             nx = cx + R * 0.16 * math.sin(t * 0.23 + 1.1)
             ny = cy + R * 0.12 * math.sin(t * 0.17) * self.aspect
-            nr = R * 0.24 * (1 + 0.05 * _heartbeat(t * 0.9 + 0.1))
+            nr = R * 0.24
             n_nuc = int(50 + 70 * density)
             for i in range(n_nuc):
                 a = TAU * _hash(i * 4.1) + t * 0.07
@@ -392,14 +389,6 @@ class MirrorScene:
                 w = 1.5 * math.sin(t * 0.9 + _hash(i * 5) * TAU)
                 (m if _hash(i * 9) > 0.3 else b).plot(int(x + w), int(y))
 
-    def _rings(self, cx, cy, R, rings, t):
-        # growth rings ripple outward like a disturbed pond, each on its own phase
-        for i in range(rings):
-            r = R * (1.15 + 0.14 * (i + 1))
-            wob = _breath(t + i * 1.7) * (1 + 0.015 * math.sin(t * 0.4 + i * 2.3))
-            self.dim.ellipse(cx, cy, r * wob, r * wob * self.aspect,
-                             steps=int(20 + r * 1.5))
-
     def _orbiters(self, orbiters, t, cx, cy, R):
         overlay = {}
         n = len(orbiters)
@@ -448,10 +437,10 @@ class MirrorScene:
                 y0 = _hash(i * 3) * self.H
                 self.dim.line(x0, y0, x0 - 4, y0 + 6)
         elif weather == "aurora":
-            for x in range(0, self.W, 2):
-                y = 3 + 3 * math.sin(x * 0.12 + t * 0.8) + 2 * math.sin(x * 0.05 - t * 0.3)
-                self.dim.plot(x, int(y))
-                self.dim.plot(x, int(y + 2))
+            # field-wide twinkle — dots fading in and out on their own rhythms
+            for i in range(30):
+                if math.sin(t * (0.6 + _hash(i)) + _hash(i * 3) * TAU) > 0.3:
+                    self.dim.plot(int(_hash(i * 7) * self.W), int(_hash(i * 11) * self.H))
         elif weather == "drift":
             for i in range(16):
                 x = (_hash(i * 11) * self.W + t * (2 + 3 * _hash(i))) % self.W
@@ -500,8 +489,7 @@ class MirrorScene:
         if pal["secondary"]:
             arch += f"  ×  {specmod.ARCHETYPES[pal['secondary']]['inspiration']}"
         l1 = f"\x1b[38;5;{brightc}m{s['motto']}\x1b[0m  \x1b[38;5;{dimc}m·  {arch}\x1b[0m"
-        l2 = (f"\x1b[38;5;{dimc}mevo #{s['evolution_count']}  ·  rings {s['rings']}"
-              f"  ·  weather {s['weather']}\x1b[0m")
+        l2 = f"\x1b[38;5;{dimc}mevo #{s['evolution_count']}\x1b[0m"
         lines = [_center_ansi(l1, self.cols), _center_ansi(l2, self.cols)]
         if signals is not None:
             counts = getattr(signals, "mem_counts", None) or {}
