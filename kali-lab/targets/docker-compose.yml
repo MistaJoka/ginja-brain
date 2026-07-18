@@ -1,0 +1,50 @@
+# Intentionally-vulnerable practice targets.
+#
+# SAFETY — two layers:
+#  * Web apps (dvwa, juice-shop): every port is bound to 127.0.0.1 (loopback)
+#    ONLY, so they're reachable from THIS machine (your browser, your Kali
+#    container) but NOT from the LAN, Wi-Fi, Tailscale, or the internet.
+#    Do not change "127.0.0.1:" to "0.0.0.0:" or drop it — that exposes you.
+#  * Metasploitable (network target with real remote-root backdoors): publishes
+#    NO ports and lives on the `lab-sealed` internal network — no inbound from
+#    LAN/host AND no internet egress. Only a container on lab-sealed (Kali via
+#    `kali --lab`) can reach it. Do not add a `ports:` block or move it off
+#    lab-sealed — that is what keeps its backdoors unreachable.
+#
+#   Start:   docker compose -f ~/kali-lab/targets/docker-compose.yml up -d
+#   Stop:    docker compose -f ~/kali-lab/targets/docker-compose.yml down
+#   Status:  docker compose -f ~/kali-lab/targets/docker-compose.yml ps
+
+networks:
+  lab-net:            # web apps — normal bridge, has egress
+    driver: bridge
+  lab-sealed:         # network target — air-gapped, no internet in or out
+    driver: bridge
+    internal: true
+
+services:
+  dvwa:
+    image: ghcr.io/digininja/dvwa:latest
+    container_name: lab-dvwa
+    restart: unless-stopped
+    networks: [lab-net]
+    ports:
+      - "127.0.0.1:4280:80"
+
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: lab-juice-shop
+    restart: unless-stopped
+    networks: [lab-net]
+    ports:
+      - "127.0.0.1:4300:3000"
+
+  # Full vulnerable Linux host for network-level pentesting (nmap -> exploit).
+  # Sealed: no published ports + internal network => unreachable from LAN/host
+  # and no internet egress. Attack it with:  kali --lab nmap -sV metasploitable
+  metasploitable:
+    image: tleemcjr/metasploitable2:latest
+    container_name: lab-metasploitable
+    restart: unless-stopped
+    networks: [lab-sealed]
+    command: sh -c "/bin/services.sh; tail -f /dev/null"

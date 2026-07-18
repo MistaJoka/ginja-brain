@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Drop into the Kali pentest lab container.
+#   kali                  -> interactive shell on the HOST network (LAN recon;
+#                            reach DVWA/Juice at 127.0.0.1:4280 / :4300)
+#   kali nmap -sV …       -> run one command on the host network and exit
+#   kali --lab            -> shell on the SEALED lab network, to attack the
+#                            air-gapped Metasploitable target by name
+#   kali --lab nmap -sV metasploitable
+#
+# Files you put in ~/kali-lab/work persist on the host (mounted at /root/work).
+# Everything else in the container is ephemeral (reset each run) — install
+# permanent tools by adding them to the Dockerfile and rebuilding.
+set -euo pipefail
+
+IMAGE="kali-lab"
+WORK="${HOME}/kali-lab/work"
+mkdir -p "${WORK}"
+
+if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    echo "Image '${IMAGE}' not built yet. Build it with:" >&2
+    echo "  docker build -t ${IMAGE} ${HOME}/kali-lab" >&2
+    exit 1
+fi
+
+# Default: host network. `--lab` attaches to the sealed target network instead.
+NETWORK="host"
+if [[ "${1:-}" == "--lab" ]]; then
+    NETWORK="targets_lab-sealed"
+    shift
+    if ! docker network inspect "${NETWORK}" >/dev/null 2>&1; then
+        echo "Lab network '${NETWORK}' is not up. Start the targets first:" >&2
+        echo "  docker compose -f ${HOME}/kali-lab/targets/docker-compose.yml up -d" >&2
+        exit 1
+    fi
+fi
+
+exec docker run -it --rm \
+    --hostname kali \
+    --network "${NETWORK}" \
+    --cap-add=NET_ADMIN --cap-add=NET_RAW \
+    -v "${WORK}:/root/work" \
+    "${IMAGE}" "$@"

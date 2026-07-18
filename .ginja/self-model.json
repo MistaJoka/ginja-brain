@@ -1,24 +1,23 @@
 {
-  "mood": "focused",
-  "neural_style": "calm",
-  "color_theme": "blue",
-  "focus_topic": "second brain knowledge graph design",
-  "self_observation": "Evolving insights, constant learning.",
-  "ascii_banner": "Ginka Evolves\u00b7",
+  "mood": "curious",
+  "neural_style": "active",
+  "color_theme": "green",
+  "focus_topic": "Video Self-Modeling",
+  "self_observation": "Enhancing real-time insights through VSM.",
+  "ascii_banner": "Evolving Insights",
   "mantras": [
-    "Infer connections",
-    "Map concepts",
-    "Visualize data"
+    "Adapt and Grow",
+    "Deepen Analysis"
   ],
-  "evolution_count": 436,
-  "generated_at": "2026-07-10T10:45:56.846228+00:00",
+  "evolution_count": 494,
+  "generated_at": "2026-07-17T10:35:17.152337+00:00",
   "phase": "mature",
-  "portrait_font": "threepoint",
-  "portrait_word": "ginka",
-  "portrait_border": "\u254e\u25cf\u2548\u2549\u00b7\u25cb",
-  "portrait_tagline": "Semantic Visualization",
-  "neural_chars": "EaOoTtLlSsRr",
-  "wonder_count": 131,
-  "eval_score": 4.25,
-  "eval_trend": -0.9
+  "portrait_font": "future",
+  "portrait_word": "Insight",
+  "portrait_border": "\u25cf\u25e6\u25e6\u25cb\u25cb\u25cf",
+  "portrait_tagline": "Real-Time Wisdom",
+  "neural_chars": ".\u00b7\u25cb\u25e6\u25c9\u25cf",
+  "wonder_count": 142,
+  "eval_score": 7.55,
+  "eval_trend": 0.0
 }
